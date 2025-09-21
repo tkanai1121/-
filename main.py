@@ -1,46 +1,21 @@
 """
 めるる – Lineage2M Boss Bot (Discord/Python)
 --------------------------------
-Features implemented per request:
-- 24/7 loop-friendly design (use any always-on host; see README at bottom of file)
-- Free to run (works on Fly.io/Render/Railway free tiers or a spare PC/Raspberry Pi)
-- Boss defeat input updates next spawn automatically
-- "BossName HHMM" sets next spawn to HH:MM (today or next day if past)
-- "reset HHMM" sets ALL bosses' next spawn to HH:MM
-- "bt" shows all upcoming spawns; "bt3"/"bt6" filter within N hours (also "!bt 3")
-- If no defeat input arrives by spawn time, auto-skip and roll to the next cycle, with counter like BossName【スキップn回】
-- Timezone fixed to Asia/Tokyo
-- Persistent storage in JSON (bosses.json)
+更新:
+- `!ボス名 HHMM` → 「HH:MM に討伐」解釈（次回 = 討伐時刻 + interval）
+- **ボス名のクイック入力は `!` 省略OK**（例: `グラーキ 1159` / `グラーキ`）
+  *通常コマンド（`addboss`/`bt`/`reset` など）は `!` 必須のまま*
 
-Commands (prefix "!")
-!addboss <Name> <hours>         # Add a boss with respawn interval (hours, can be decimal)
-!delboss <Name>                  # Remove a boss
-!interval <Name> <hours>         # Change respawn interval
-!BossName                        # Mark boss defeated now -> next spawn = now + interval
-!BossName HHMM                   # Set boss next spawn to HH:MM (today/tomorrow)
-!reset HHMM                      # Set ALL bosses next spawn to HH:MM (today/tomorrow)
-!bt [N]                          # List upcoming spawns; if N provided show within N hours
-!bt3 / !bt6                      # Shorthand filters (3 or 6 hours)
-!bosses                          # List all bosses + interval
-!help                            # Show help
-
-Environment variables:
-DISCORD_TOKEN   = your Discord bot token
-ANNOUNCE_CHANNEL_ID = channel ID for spawn announcements (optional; if omitted, bot uses first text channel it can send to)
-TZ              = Asia/Tokyo (optional; we force Asia/Tokyo in code regardless)
-
-Requirements (requirements.txt):
-discord.py==2.4.0
-python-dateutil==2.9.0.post0
-aiohttp==3.9.5
+このファイル1つで動作。Render でもローカルでもOK。
 """
 
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, time
-from typing import Dict, Optional, List
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List, Tuple
 
 import discord
 from discord.ext import commands, tasks
@@ -63,21 +38,13 @@ class Boss:
     interval_minutes: int
     next_spawn_iso: Optional[str] = None
     skip_count: int = 0
-    last_announced_iso: Optional[str] = None  # prevent duplicate announce within same minute
+    last_announced_iso: Optional[str] = None
 
     def next_spawn_dt(self) -> Optional[datetime]:
-        return (
-            datetime.fromisoformat(self.next_spawn_iso).astimezone(JST)
-            if self.next_spawn_iso
-            else None
-        )
+        return datetime.fromisoformat(self.next_spawn_iso).astimezone(JST) if self.next_spawn_iso else None
 
     def set_next_spawn(self, dt: datetime):
         self.next_spawn_iso = dt.astimezone(JST).isoformat()
-
-    def due(self, now: datetime) -> bool:
-        ns = self.next_spawn_dt()
-        return bool(ns and ns <= now)
 
 
 def load_store() -> Dict[str, Boss]:
@@ -85,32 +52,23 @@ def load_store() -> Dict[str, Boss]:
         return {}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    bosses: Dict[str, Boss] = {}
-    for k, v in raw.items():
-        bosses[k.lower()] = Boss(**v)
-    return bosses
+    return {k.lower(): Boss(**v) for k, v in raw.items()}
 
 
 def save_store(store: Dict[str, Boss]):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump({k: asdict(v) for k, v in store.items()}, f, ensure_ascii=False, indent=2)
 
-
 # =========================
 # Utilities
 # =========================
 
 def hhmm_to_dt(hhmm: str, base: Optional[datetime] = None) -> Optional[datetime]:
-    """Parse "HHMM" into a JST datetime today (or tomorrow if past)."""
     if base is None:
         base = datetime.now(JST)
     try:
-        hh = int(hhmm[:2])
-        mm = int(hhmm[2:4])
-        target = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if target < base:
-            target += timedelta(days=1)
-        return target
+        hh = int(hhmm[:2]); mm = int(hhmm[2:4])
+        return base.replace(hour=hh, minute=mm, second=0, microsecond=0)
     except Exception:
         return None
 
@@ -124,12 +82,40 @@ def find_announce_channel(guild: discord.Guild) -> Optional[discord.TextChannel]
         ch = guild.get_channel(ANNOUNCE_CHANNEL_ID)
         if isinstance(ch, discord.TextChannel):
             return ch
-    # fallback: first text channel we can talk in
     for ch in guild.text_channels:
         if ch.permissions_for(guild.me).send_messages:
             return ch
     return None
 
+
+def normalize(text: str) -> str:
+    # シンプルな正規化（全角/半角ひらがなカタカナは Discord 側入力が一定でないことがあるため最小限）
+    return text.strip().lower()
+
+
+def parse_boss_quick(content: str, boss_keys: List[str]) -> Optional[Tuple[str, Optional[str]]]:
+    """`グラーキ 1159` / `!グラーキ 1159` / `グラーキ` / `!グラーキ` を検出。
+    戻り値: (boss_key, hhmm or None)
+    """
+    s = content.strip()
+    if not s:
+        return None
+    # `!` はあってもなくてもよい（先頭1個のみ許可）
+    if s.startswith(PREFIX):
+        s = s[len(PREFIX):].lstrip()
+    # 先頭トークンがボス名か？
+    parts = s.split()
+    if not parts:
+        return None
+    key = normalize(parts[0])
+    if key not in boss_keys:
+        return None
+    hhmm = None
+    if len(parts) >= 2:
+        m = re.fullmatch(r"(\d{4})", parts[1])
+        if m:
+            hhmm = m.group(1)
+    return key, hhmm
 
 # =========================
 # Bot Setup
@@ -140,40 +126,40 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 store: Dict[str, Boss] = {}
 
-
+# =========================
+# Events
+# =========================
 @bot.event
 async def on_ready():
     global store
     store = load_store()
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("Guilds:", [g.name for g in bot.guilds])
+    print(f"Logged in as {bot.user}")
     if not ticker.is_running():
         ticker.start()
 
 
 # =========================
-# Core Commands
+# Commands (prefix必須)
 # =========================
-
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
     msg = (
         "**めるる コマンド**\n"
-        f"プレフィックス: `{PREFIX}`\n\n"
+        f"プレフィックス: `{PREFIX}`（※**ボス名だけは `!` 省略OK**）\n\n"
         "**登録/設定**\n"
-        f"`{PREFIX}addboss <Name> <hours>` 例: `{PREFIX}addboss アナキム 8`\n"
+        f"`{PREFIX}addboss <Name> <hours>` 例: `{PREFIX}addboss グラーキ 8`\n"
         f"`{PREFIX}delboss <Name>`\n"
         f"`{PREFIX}interval <Name> <hours>`\n"
         f"`{PREFIX}bosses` 登録済みボス一覧\n\n"
         "**更新/リセット**\n"
-        f"`{PREFIX}<BossName>` 討伐入力(今) → 次回=今+interval\n"
-        f"`{PREFIX}<BossName> HHMM` 例: `{PREFIX}アナキム 2130`\n"
-        f"`{PREFIX}reset HHMM` 全ボスをその時刻へ\n\n"
+        f"`{PREFIX}<BossName>` 討伐(今) → 次回=今+interval  ※`!`省略可\n"
+        f"`{PREFIX}<BossName> HHMM` 例: `{PREFIX}グラーキ 1159` = **11:59に討伐 → 次回=+interval**  ※`!`省略可\n"
+        f"`{PREFIX}reset HHMM` 全ボスをその時刻へ（こちらは `!` 必須）\n\n"
         "**表示**\n"
         f"`{PREFIX}bt [N]` 例: `{PREFIX}bt`, `{PREFIX}bt 3`\n"
         f"`{PREFIX}bt3` / `{PREFIX}bt6`\n\n"
         "**自動スキップ**\n"
-        "スポーン時刻までに討伐入力が無い場合、1サイクル自動スキップして再告知。`【スキップn回】`をタイトルに付与します。\n"
+        "スポーン時刻までに討伐入力が無い場合、1サイクル自動スキップし `【スキップn回】` を付与して再告知。\n"
     )
     await ctx.send(msg)
 
@@ -184,7 +170,7 @@ async def addboss(ctx: commands.Context, name: str, hours: str):
         interval_h = float(hours)
     except ValueError:
         return await ctx.send("時間は数値で指定してください (例: 8 または 1.5)")
-    key = name.lower()
+    key = normalize(name)
     store[key] = Boss(name=name, interval_minutes=int(round(interval_h * 60)))
     save_store(store)
     await ctx.send(f"✅ 追加: {name} (リスポーン {interval_h}h)")
@@ -192,7 +178,7 @@ async def addboss(ctx: commands.Context, name: str, hours: str):
 
 @bot.command(name="delboss")
 async def delboss(ctx: commands.Context, name: str):
-    key = name.lower()
+    key = normalize(name)
     if key in store:
         del store[key]
         save_store(store)
@@ -203,7 +189,7 @@ async def delboss(ctx: commands.Context, name: str):
 
 @bot.command(name="interval")
 async def set_interval(ctx: commands.Context, name: str, hours: str):
-    key = name.lower()
+    key = normalize(name)
     if key not in store:
         return await ctx.send("未登録のボスです。まず `!addboss` してください。")
     try:
@@ -227,9 +213,12 @@ async def bosses(ctx: commands.Context):
 
 @bot.command(name="reset")
 async def reset_all(ctx: commands.Context, hhmm: str):
-    target = hhmm_to_dt(hhmm)
-    if not target:
+    base = datetime.now(JST)
+    target_today = hhmm_to_dt(hhmm, base=base)
+    if not target_today:
         return await ctx.send("時刻は HHMM で入力してください。例: 0930")
+    # 未来に合わせる（現在時刻を過ぎていれば今日、過ぎていなければ今日のその時間）
+    target = target_today if target_today >= base.replace(second=0, microsecond=0) else target_today
     for b in store.values():
         b.set_next_spawn(target)
         b.skip_count = 0
@@ -282,46 +271,35 @@ async def send_board(channel: discord.TextChannel, within_hours: Optional[float]
 
 
 # =========================
-# Message Hook for "!<Boss>" and "!<Boss> HHMM"
+# Quick input (ボス名だけは `!` 省略OK)
 # =========================
-
 @bot.listen("on_message")
 async def boss_quick_update(message: discord.Message):
     if message.author.bot:
         return
-    if not message.content.startswith(PREFIX):
+    if not store:
         return
-    # ignore if it's a known command name
-    parts = message.content[len(PREFIX):].strip().split()
-    if not parts:
+    parsed = parse_boss_quick(message.content, list(store.keys()))
+    if not parsed:
         return
-    cmd = parts[0].lower()
-    known = {"addboss","delboss","interval","reset","bt","bt3","bt6","bosses","help"}
-    if cmd in known:
-        return
-    # treat as BossName [HHMM]
-    key = cmd
-    if key not in store:
-        return  # silently ignore unknown boss aliases so normal chat isn't polluted
-
+    key, hhmm = parsed
     now = datetime.now(JST)
     boss = store[key]
 
-    # If HHMM provided -> set next spawn to that specific time
-    if len(parts) >= 2:
-        hhmm = parts[1]
-        target = hhmm_to_dt(hhmm, base=now)
-        if not target:
+    if hhmm:  # HHMM で討伐時刻を指定 → 次回 = 討伐時刻 + interval
+        kill_time = hhmm_to_dt(hhmm, base=now)
+        if not kill_time:
             await message.channel.send("時刻は HHMM で入力してください。例: 0930")
             return
-        boss.set_next_spawn(target)
+        next_dt = kill_time + timedelta(minutes=boss.interval_minutes)
+        boss.set_next_spawn(next_dt)
         boss.skip_count = 0
         boss.last_announced_iso = None
         save_store(store)
-        await message.channel.send(f"🕘 {boss.name} 次回スポーンを {fmt_dt(target)} に設定しました。")
+        await message.channel.send(f"⚔️ {boss.name} {kill_time.strftime('%H:%M')} に討伐 → 次回 {fmt_dt(next_dt)}")
         return
 
-    # Otherwise: defeat now -> next = now + interval
+    # 時刻なしは「今討伐」扱い
     next_dt = now + timedelta(minutes=boss.interval_minutes)
     boss.set_next_spawn(next_dt)
     boss.skip_count = 0
@@ -333,7 +311,6 @@ async def boss_quick_update(message: discord.Message):
 # =========================
 # Background ticker – checks every 60s
 # =========================
-
 @tasks.loop(seconds=60.0)
 async def ticker():
     now = datetime.now(JST)
@@ -345,26 +322,20 @@ async def ticker():
             ns = b.next_spawn_dt()
             if not ns:
                 continue
-            # Dedup announce within the same minute
             if b.last_announced_iso:
                 last = datetime.fromisoformat(b.last_announced_iso).astimezone(JST)
                 if last >= now - timedelta(minutes=1):
                     continue
-            # If due or overdue
             if ns <= now:
-                # No defeat input -> auto-skip 1 cycle and re-announce
                 b.skip_count += 1
                 next_dt = ns + timedelta(minutes=b.interval_minutes)
                 b.set_next_spawn(next_dt)
                 b.last_announced_iso = now.isoformat()
                 save_store(store)
-                try:
-                    await channel.send(
-                        f"⏰ **{b.name}【スキップ{b.skip_count}回】** → 次 {fmt_dt(next_dt)}\n"
-                        f"(討伐入力が無かったため自動スキップしました。`!{b.name} HHMM` または `!{b.name}` で更新可)"
-                    )
-                except Exception as e:
-                    print("announce error:", e)
+                await channel.send(
+                    f"⏰ **{b.name}【スキップ{b.skip_count}回】** → 次 {fmt_dt(next_dt)}\n"
+                    f"(討伐入力が無かったため自動スキップしました。`{PREFIX}{b.name} HHMM` または `{PREFIX}{b.name}` で更新可)"
+                )
 
 
 @ticker.before_loop
@@ -381,12 +352,8 @@ except Exception:
     web = None
 
 async def start_http_server():
-    """Start a tiny HTTP server so external pingers (UptimeRobot) can hit /health.
-    Render の無料 Web サービスは 15分無通信でスリープするため、
-    5分おきに外部から叩いてもらう想定です。
-    """
     if web is None:
-        return  # aiohttp 未インストールでもBOT自体は動かす
+        return
     app = web.Application()
 
     async def health(_):
@@ -402,6 +369,7 @@ async def start_http_server():
     await site.start()
     print(f"HTTP server started on :{port}")
 
+
 # =========================
 # Bootstrap
 # =========================
@@ -409,7 +377,6 @@ async def amain():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Please set DISCORD_TOKEN environment variable")
-    # Run Discord bot and HTTP server concurrently
     await asyncio.gather(
         bot.start(token),
         start_http_server(),
@@ -420,81 +387,37 @@ if __name__ == "__main__":
 
 
 # =========================
-# README (quick start)
+# Requirements (requirements.txt)
 # =========================
-"""
-1) Discord 側の準備
-- https://discord.com/developers/applications で新規アプリ作成 → Bot を追加 → Token をコピー
-- PRIVILEGED INTENTS: "MESSAGE CONTENT INTENT" を ON
-- OAuth2 → URL Generator → scopes: bot, permissions: Send Messages, Read Messages → 生成URLでサーバーに招待
+# discord.py のボイス依存が audioop を参照するため、Python 3.11 を推奨（標準で含まれる）
+# Render では Environment に PYTHON_VERSION=3.11.9 を設定しておくと安定します。
+#
+# 以下を requirements.txt に保存：
+# --------------------------------
+# discord.py==2.4.0
+# python-dateutil==2.9.0.post0
+# aiohttp==3.9.5
+# --------------------------------
 
-2) ローカル実行 (Windows/Mac/Linux)
-python -m venv .venv
-. .venv/bin/activate  (Windows: .venv\\Scripts\\activate)
-pip install -r requirements.txt   # 下記参照
-set DISCORD_TOKEN=xxxx   (PowerShell: $env:DISCORD_TOKEN="xxxx")
-# 任意: アナウンス用チャンネルを固定したい場合
-set ANNOUNCE_CHANNEL_ID=123456789012345678
-python main.py
+# =========================
+# render.yaml（例）
+# =========================
+# --------------------------------
+# services:
+#   - type: web
+#     name: meruru-boss-bot
+#     env: python
+#     plan: free
+#     region: singapore
+#     buildCommand: "pip install -r requirements.txt"
+#     startCommand: "python main.py"
+#     autoDeploy: true
+#     envVars:
+#       - key: DISCORD_TOKEN
+#         sync: false
+#       - key: ANNOUNCE_CHANNEL_ID
+#         sync: false
+#       - key: PYTHON_VERSION
+#         value: 3.11.9
+# --------------------------------
 
-requirements.txt:
---------------------------------
-discord.py==2.4.0
-python-dateutil==2.9.0.post0
---------------------------------
-
-3) 初期セットアップ (Discord内)
-!addboss アナキム 8
-!addboss リリス 8
-!addboss コア 12
-!bosses
-!reset 0900     # 全ボスの次回スポーンを 09:00 に仮置き
-
-4) 使い方例
-- 討伐したら → `!アナキム` (今+8h)
-- 固定の時刻に変えたい → `!アナキム 2130`
-- 全部同じ時刻にしたい → `!reset 0000`
-- 一覧 → `!bt` / 3時間以内 → `!bt3` / 6時間以内 → `!bt 6`
-
-5) 24時間無料運用のコツ
-- 家の常時起動PC/古いノート/Raspberry Piで動かすのが確実に無料。
-- クラウド無料枠 (時期で変動): Render/Railway/Fly.io など。無料枠はスリープや時間制限の場合あり。
-  → "スリープしない" が必要なら自前の常時起動マシンが最安定。
-- **Render無料プランを使う場合**: このファイルは HTTP サーバーを内蔵しています（/health）。UptimeRobot 等から5分おきにアクセスすればスリープしにくくなります（各サービスのポリシーに従ってご利用ください）。
-
-6) Render にデプロイ（無料枠想定）
-- リポジトリ直下に `render.yaml` を置くとワンクリックデプロイが楽です。
-
-render.yaml（例）
---------------------------------
-services:
-  - type: web            # webにしてHTTPを公開（/health 用）
-    name: meruru-boss-bot
-    env: python
-    plan: free
-    region: singapore    # 近いリージョンに変更可（東京はProのみの場合あり）
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
-    autoDeploy: true
-    envVars:
-      - key: DISCORD_TOKEN
-        sync: false        # 手動でダッシュボードに設定
-      - key: ANNOUNCE_CHANNEL_ID
-        sync: false
---------------------------------
-
-7) UptimeRobot の設定（5分おきに起こす）
-- 監視タイプ: HTTP(s)
-- URL: `https://<Renderのホスト名>/health`
-- チェック間隔: 5分
-- 注意: 無料プランの制約や Render のポリシー変更により動作が変わることがあります。
-
-8) よくあるカスタム
-- ボスごとに時間窓(例: 8h ± 30m)を持たせる → interval_minutes と別に window_minutes を追加し、告知文を調整
-- 役職メンションを付けたい → announce時に <@&ROLE_ID> を文中に追加
-- 複数ギルドで別データにしたい → guild.id ごとに json を分ける
-- ボスごとに時間窓(例: 8h ± 30m)を持たせる → interval_minutes と別に window_minutes を追加し、告知文を調整
-- 役職メンションを付けたい → announce時に <@&ROLE_ID> を文中に追加
-- 複数ギルドで別データにしたい → guild.id ごとに json を分ける
-
-困ったらこのファイルを貼ったまま「この仕様を追加して」と言ってください。"""
