@@ -154,7 +154,7 @@ async def _help(ctx: commands.Context):
         "**更新/リセット**\n"
         f"`{PREFIX}<BossName>` 討伐(今) → 次回=今+interval  ※`!`省略可\n"
         f"`{PREFIX}<BossName> HHMM` 例: `{PREFIX}グラーキ 1159` = **11:59に討伐 → 次回=+interval**  ※`!`省略可\n"
-        f"`{PREFIX}reset HHMM` 全ボスをその時刻へ（こちらは `!` 必須）\n\n"
+        f"`{PREFIX}reset HHMM` **全ボスの最終討伐時間**を HH:MM に統一（= 各ボスの次回は *討伐時刻 + interval*）。こちらは `!` 必須。\n\n"
         "**表示**\n"
         f"`{PREFIX}bt [N]` 例: `{PREFIX}bt`, `{PREFIX}bt 3`\n"
         f"`{PREFIX}bt3` / `{PREFIX}bt6`\n\n"
@@ -214,17 +214,17 @@ async def bosses(ctx: commands.Context):
 @bot.command(name="reset")
 async def reset_all(ctx: commands.Context, hhmm: str):
     base = datetime.now(JST)
-    target_today = hhmm_to_dt(hhmm, base=base)
-    if not target_today:
+    kill_time = hhmm_to_dt(hhmm, base=base)
+    if not kill_time:
         return await ctx.send("時刻は HHMM で入力してください。例: 0930")
-    # 未来に合わせる（現在時刻を過ぎていれば今日、過ぎていなければ今日のその時間）
-    target = target_today if target_today >= base.replace(second=0, microsecond=0) else target_today
+    # 全ボスの「最終討伐」を指定時刻に統一 → 次回 = 討伐時刻 + interval
     for b in store.values():
-        b.set_next_spawn(target)
+        next_dt = kill_time + timedelta(minutes=b.interval_minutes)
+        b.set_next_spawn(next_dt)
         b.skip_count = 0
         b.last_announced_iso = None
     save_store(store)
-    await ctx.send(f"♻️ 全ボスの次回を {fmt_dt(target)} にリセットしました。")
+    await ctx.send(f"♻️ 全ボスの**最終討伐**を {kill_time.strftime('%H:%M')} に設定 → 次回は各ボスの interval で更新しました。")
 
 
 @bot.command(name="bt")
