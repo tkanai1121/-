@@ -1,12 +1,16 @@
 """
 めるる – Lineage2M Boss Bot (Discord/Python)
 --------------------------------
-更新:
-- `!ボス名 HHMM` → 「HH:MM に討伐」解釈（次回 = 討伐時刻 + interval）
-- **ボス名のクイック入力は `!` 省略OK**（例: `グラーキ 1159` / `グラーキ`）
-  *通常コマンド（`addboss`/`bt`/`reset` など）は `!` 必須のまま*
+機能:
+- ボス名だけのクイック入力は `!` 省略OK（例: `グラーキ 1159` / `グラーキ`）
+- `ボス名 HHMM` は「HH:MM に討伐」解釈（次回 = 討伐時刻 + interval）
+- `!reset HHMM` は「全ボスの**最終討伐時間**を HH:MM に統一」（次回は各 interval で更新）
+- 一括登録:
+    - プリセット: `!preset jp`（日本向けフィールドボスまとめ登録）
+    - 任意リスト: `!bulkadd` の下に複数行で `<名前> <時間>` を貼る
+- /health で軽量HTTPサーバー（Render等の監視用）
 
-このファイル1つで動作。Render でもローカルでもOK。
+Python 3.11.x 推奨（Render の Environment に PYTHON_VERSION=3.11.9）。
 """
 
 import asyncio
@@ -28,6 +32,29 @@ PREFIX = "!"
 JST = gettz("Asia/Tokyo")
 DATA_FILE = "bosses.json"
 ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))
+
+# =========================
+# Presets (JP field bosses)
+# =========================
+PRESET_BOSSES: Dict[str, List[Tuple[str, float]]] = {
+    "jp": [
+        # グルーディオ
+        ("チェルトゥバ", 6), ("バシラ", 4), ("ケルソス", 10), ("サヴァン", 12), ("クイーンアント", 6), ("トロンバ", 7),
+        # ディオン
+        ("フェリス", 3), ("タラキン", 10), ("エンクラ", 6), ("パンドライド", 12), ("ミュータントクルマ", 8),
+        ("テンペスト", 6), ("汚染したクルマ", 8), ("カタン", 10), ("コアサセプタ", 10),
+        ("サルカ", 10), ("ディミトリス", 12), ("スタン", 7), ("ガレス", 9),
+        # ギラン
+        ("メデューサ", 10), ("ブラックリリー", 12), ("マトゥラ", 6), ("ブレカ", 6), ("パンナロード", 5), ("ベヒモス", 9),
+        ("ドラゴンビースト", 12),
+        # オーレン（ランダムのフライン系は除外）
+        ("タルキン", 8), ("セル", 12), ("バルボ", 12), ("ティミニエル", 8), ("レピロ", 7), ("オルフェン", 24),
+        ("コルーン", 12), ("サミュエル", 12),
+        # アデン
+        ("忘却の鏡", 11), ("ヒシルローメ", 6), ("ランドール", 9), ("グラーキ", 8), ("オルクス", 24), ("カプリオ", 12),
+        ("フリント", 5), ("ハーフ", 20), ("アンドラス", 15), ("タナトス", 25), ("ラーハ", 33), ("フェニックス", 24),
+    ]
+}
 
 # =========================
 # Models & Storage
@@ -83,13 +110,13 @@ def find_announce_channel(guild: discord.Guild) -> Optional[discord.TextChannel]
         if isinstance(ch, discord.TextChannel):
             return ch
     for ch in guild.text_channels:
-        if ch.permissions_for(guild.me).send_messages:
+        me = guild.me or guild.get_member(guild.owner_id)
+        if me and ch.permissions_for(me).send_messages:
             return ch
     return None
 
 
 def normalize(text: str) -> str:
-    # シンプルな正規化（全角/半角ひらがなカタカナは Discord 側入力が一定でないことがあるため最小限）
     return text.strip().lower()
 
 
@@ -117,6 +144,12 @@ def parse_boss_quick(content: str, boss_keys: List[str]) -> Optional[Tuple[str, 
             hhmm = m.group(1)
     return key, hhmm
 
+
+def parse_hours(token: str) -> Optional[float]:
+    """'8' '8h' '8時間' '1.5' を数値として解釈"""
+    m = re.search(r"\d+(?:\.\d+)?", token)
+    return float(m.group()) if m else None
+
 # =========================
 # Bot Setup
 # =========================
@@ -137,7 +170,6 @@ async def on_ready():
     if not ticker.is_running():
         ticker.start()
 
-
 # =========================
 # Commands (prefix必須)
 # =========================
@@ -150,7 +182,9 @@ async def _help(ctx: commands.Context):
         f"`{PREFIX}addboss <Name> <hours>` 例: `{PREFIX}addboss グラーキ 8`\n"
         f"`{PREFIX}delboss <Name>`\n"
         f"`{PREFIX}interval <Name> <hours>`\n"
-        f"`{PREFIX}bosses` 登録済みボス一覧\n\n"
+        f"`{PREFIX}bosses` 登録済みボス一覧\n"
+        f"`{PREFIX}preset jp` 定義済みの日本向けフィールドボスを**一括登録**\n"
+        f"`{PREFIX}bulkadd <複数行>` まとめて登録（下の使い方を参照）\n\n"
         "**更新/リセット**\n"
         f"`{PREFIX}<BossName>` 討伐(今) → 次回=今+interval  ※`!`省略可\n"
         f"`{PREFIX}<BossName> HHMM` 例: `{PREFIX}グラーキ 1159` = **11:59に討伐 → 次回=+interval**  ※`!`省略可\n"
@@ -158,8 +192,14 @@ async def _help(ctx: commands.Context):
         "**表示**\n"
         f"`{PREFIX}bt [N]` 例: `{PREFIX}bt`, `{PREFIX}bt 3`\n"
         f"`{PREFIX}bt3` / `{PREFIX}bt6`\n\n"
-        "**自動スキップ**\n"
-        "スポーン時刻までに討伐入力が無い場合、1サイクル自動スキップし `【スキップn回】` を付与して再告知。\n"
+        "**bulkadd の使い方**\n"
+        "1メッセージで改行区切りで貼り付け:\n"
+        "```\n"
+        "!bulkadd\n"
+        "グラーキ 8\n"
+        "エンクラ 6\n"
+        "チェルトゥバ 6\n"
+        "```\n"
     )
     await ctx.send(msg)
 
@@ -246,6 +286,60 @@ async def bt3(ctx: commands.Context):
 @bot.command(name="bt6")
 async def bt6(ctx: commands.Context):
     await send_board(ctx.channel, within_hours=6)
+
+
+@bot.command(name="preset")
+async def preset(ctx: commands.Context, key: str):
+    key = key.lower()
+    if key not in PRESET_BOSSES:
+        return await ctx.send("使い方: `!preset jp`")
+    added = 0
+    for name, h in PRESET_BOSSES[key]:
+        k = normalize(name)
+        store[k] = Boss(name=name, interval_minutes=int(round(h * 60)))
+        added += 1
+    save_store(store)
+    await ctx.send(f"📦 プリセット `{key}` を登録: {added}件 追加/更新しました。(`!bosses` で確認)")
+
+
+@bot.command(name="bulkadd")
+async def bulkadd(ctx: commands.Context, *, body: str = ""):
+    """
+    改行区切りで <名前> <時間> をまとめて登録。例:
+    !bulkadd
+    グラーキ 8
+    エンクラ 6
+    """
+    # コマンド全文から手動で切り出す（複数行対応）
+    content = ctx.message.content
+    # 先頭の "!bulkadd" を除去
+    idx = content.lower().find("!bulkadd")
+    if idx >= 0:
+        body = content[idx + len("!bulkadd"):].strip()
+    # コードブロックがあれば中身だけ抽出
+    m = re.search(r"```(.*?)```", body, flags=re.DOTALL)
+    if m:
+        body = m.group(1).strip()
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return await ctx.send("使い方：`!bulkadd` の次の行から「<名前> <時間>」を改行で並べて送ってください。")
+    added, failed = 0, []
+    for ln in lines:
+        parts = ln.split()
+        if len(parts) < 2:
+            failed.append(ln); continue
+        hours_val = parse_hours(parts[-1])
+        name = " ".join(parts[:-1])
+        if hours_val is None or not name:
+            failed.append(ln); continue
+        key = normalize(name)
+        store[key] = Boss(name=name, interval_minutes=int(round(hours_val * 60)))
+        added += 1
+    save_store(store)
+    msg = f"✅ 一括登録: {added}件 追加/更新しました。"
+    if failed:
+        msg += f"\n⚠️ 失敗: {len(failed)}行 → `{failed[0]}` など（形式: `<名前> <時間>`）"
+    await ctx.send(msg)
 
 
 async def send_board(channel: discord.TextChannel, within_hours: Optional[float] = None):
@@ -384,40 +478,3 @@ async def amain():
 
 if __name__ == "__main__":
     asyncio.run(amain())
-
-
-# =========================
-# Requirements (requirements.txt)
-# =========================
-# discord.py のボイス依存が audioop を参照するため、Python 3.11 を推奨（標準で含まれる）
-# Render では Environment に PYTHON_VERSION=3.11.9 を設定しておくと安定します。
-#
-# 以下を requirements.txt に保存：
-# --------------------------------
-# discord.py==2.4.0
-# python-dateutil==2.9.0.post0
-# aiohttp==3.9.5
-# --------------------------------
-
-# =========================
-# render.yaml（例）
-# =========================
-# --------------------------------
-# services:
-#   - type: web
-#     name: meruru-boss-bot
-#     env: python
-#     plan: free
-#     region: singapore
-#     buildCommand: "pip install -r requirements.txt"
-#     startCommand: "python main.py"
-#     autoDeploy: true
-#     envVars:
-#       - key: DISCORD_TOKEN
-#         sync: false
-#       - key: ANNOUNCE_CHANNEL_ID
-#         sync: false
-#       - key: PYTHON_VERSION
-#         value: 3.11.9
-# --------------------------------
-
