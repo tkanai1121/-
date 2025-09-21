@@ -1,13 +1,18 @@
 """
 めるる – Lineage2M Boss Bot (Discord/Python)
 --------------------------------
-機能:
-- ボス名だけのクイック入力は `!` 省略OK（例: `グラーキ 1159` / `グラーキ`）
+機能ハイライト:
+- ボス名だけのクイック入力は `!` 省略OK（例: `グラーキ 1159` / `鏡 0930`）
 - `ボス名 HHMM` は「HH:MM に討伐」解釈（次回 = 討伐時刻 + interval）
 - `!reset HHMM` は「全ボスの**最終討伐時間**を HH:MM に統一」（次回は各 interval で更新）
 - 一括登録:
-    - プリセット: `!preset jp`（日本向けフィールドボスまとめ登録）
+    - プリセット: `!preset jp`（日本向けフィールドボスまとめ登録＋代表エイリアス）
     - 任意リスト: `!bulkadd` の下に複数行で `<名前> <時間>` を貼る
+- **エイリアス（別名）**:
+    - 追加: `!alias <別名> <正式名>` 例: `!alias 鏡 忘却の鏡`
+    - 解除: `!unalias <別名>`
+    - 一覧: `!aliases`
+- クイック入力は **エイリアス優先 → 前方一致 → 部分一致** の順で解決（曖昧なら候補提示）
 - /health で軽量HTTPサーバー（Render等の監視用）
 
 Python 3.11.x 推奨（Render の Environment に PYTHON_VERSION=3.11.9）。
@@ -31,10 +36,11 @@ from dateutil.tz import gettz
 PREFIX = "!"
 JST = gettz("Asia/Tokyo")
 DATA_FILE = "bosses.json"
+ALIAS_FILE = "aliases.json"
 ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))
 
 # =========================
-# Presets (JP field bosses)
+# Presets (JP field bosses + default aliases)
 # =========================
 PRESET_BOSSES: Dict[str, List[Tuple[str, float]]] = {
     "jp": [
@@ -47,13 +53,29 @@ PRESET_BOSSES: Dict[str, List[Tuple[str, float]]] = {
         # ギラン
         ("メデューサ", 10), ("ブラックリリー", 12), ("マトゥラ", 6), ("ブレカ", 6), ("パンナロード", 5), ("ベヒモス", 9),
         ("ドラゴンビースト", 12),
-        # オーレン（ランダムのフライン系は除外）
+        # オーレン（フライン系はランダムのため除外）
         ("タルキン", 8), ("セル", 12), ("バルボ", 12), ("ティミニエル", 8), ("レピロ", 7), ("オルフェン", 24),
         ("コルーン", 12), ("サミュエル", 12),
         # アデン
         ("忘却の鏡", 11), ("ヒシルローメ", 6), ("ランドール", 9), ("グラーキ", 8), ("オルクス", 24), ("カプリオ", 12),
         ("フリント", 5), ("ハーフ", 20), ("アンドラス", 15), ("タナトス", 25), ("ラーハ", 33), ("フェニックス", 24),
     ]
+}
+
+# 代表的なエイリアス（※必要に応じて自分で追加/編集OK）
+PRESET_ALIASES: Dict[str, Dict[str, str]] = {
+    "jp": {
+        "鏡": "忘却の鏡",
+        "汚染": "汚染したクルマ", "おせん": "汚染したクルマ",
+        "ﾆｴﾙ": "ティミニエル", "ニエル": "ティミニエル",
+        "コア": "コアサセプタ",
+        "アント": "クイーンアント",
+        "メデュ": "メデューサ",
+        "ランド": "ランドール",
+        "ベヒ": "ベヒモス",
+        "パンナ": "パンナロード",
+        "クイーンアント": "QA",
+    }
 }
 
 # =========================
@@ -86,9 +108,25 @@ def save_store(store: Dict[str, Boss]):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump({k: asdict(v) for k, v in store.items()}, f, ensure_ascii=False, indent=2)
 
+# --- aliases ---
+def load_aliases() -> Dict[str, str]:
+    if not os.path.exists(ALIAS_FILE):
+        return {}
+    with open(ALIAS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_aliases(aliases: Dict[str, str]):
+    with open(ALIAS_FILE, "w", encoding="utf-8") as f:
+        json.dump(aliases, f, ensure_ascii=False, indent=2)
+
 # =========================
 # Utilities
 # =========================
+def normalize(text: str) -> str:
+    t = text.strip().lower()
+    for ch in (" ", "　", "・", "/", "／"):
+        t = t.replace(ch, "")
+    return t
 
 def hhmm_to_dt(hhmm: str, base: Optional[datetime] = None) -> Optional[datetime]:
     if base is None:
@@ -99,10 +137,8 @@ def hhmm_to_dt(hhmm: str, base: Optional[datetime] = None) -> Optional[datetime]
     except Exception:
         return None
 
-
 def fmt_dt(dt: Optional[datetime]) -> str:
     return dt.astimezone(JST).strftime("%m/%d %H:%M") if dt else "—"
-
 
 def find_announce_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     if ANNOUNCE_CHANNEL_ID:
@@ -115,40 +151,36 @@ def find_announce_channel(guild: discord.Guild) -> Optional[discord.TextChannel]
             return ch
     return None
 
-
-def normalize(text: str) -> str:
-    return text.strip().lower()
-
-
-def parse_boss_quick(content: str, boss_keys: List[str]) -> Optional[Tuple[str, Optional[str]]]:
-    """`グラーキ 1159` / `!グラーキ 1159` / `グラーキ` / `!グラーキ` を検出。
-    戻り値: (boss_key, hhmm or None)
-    """
-    s = content.strip()
-    if not s:
-        return None
-    # `!` はあってもなくてもよい（先頭1個のみ許可）
-    if s.startswith(PREFIX):
-        s = s[len(PREFIX):].lstrip()
-    # 先頭トークンがボス名か？
-    parts = s.split()
-    if not parts:
-        return None
-    key = normalize(parts[0])
-    if key not in boss_keys:
-        return None
-    hhmm = None
-    if len(parts) >= 2:
-        m = re.fullmatch(r"(\d{4})", parts[1])
-        if m:
-            hhmm = m.group(1)
-    return key, hhmm
-
-
 def parse_hours(token: str) -> Optional[float]:
-    """'8' '8h' '8時間' '1.5' を数値として解釈"""
     m = re.search(r"\d+(?:\.\d+)?", token)
     return float(m.group()) if m else None
+
+def resolve_boss_key(token: str, store: Dict[str, Boss], aliases: Dict[str, str]) -> Tuple[Optional[str], List[str]]:
+    """
+    入力トークンを「エイリアス→前方一致→部分一致」で解決。
+    返り値: (決定キー or None, 曖昧候補リスト)
+    """
+    q = normalize(token)
+    if not q:
+        return None, []
+    # 1) alias
+    if q in aliases:
+        return aliases[q], []
+    # 2) exact key
+    if q in store:
+        return q, []
+    # 3) 前方一致
+    starts = [k for k in store if normalize(store[k].name).startswith(q)]
+    if len(starts) == 1:
+        return starts[0], []
+    # 4) 部分一致
+    subs = [k for k in store if q in normalize(store[k].name)]
+    if len(subs) == 1:
+        return subs[0], []
+    # 曖昧
+    # 候補を（前方一致 > 部分一致）の順で提示
+    cand = list(dict.fromkeys(starts + subs))[:6]
+    return None, [store[k].name for k in cand]
 
 # =========================
 # Bot Setup
@@ -158,14 +190,16 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 store: Dict[str, Boss] = {}
+aliases: Dict[str, str] = {}
 
 # =========================
 # Events
 # =========================
 @bot.event
 async def on_ready():
-    global store
+    global store, aliases
     store = load_store()
+    aliases = load_aliases()
     print(f"Logged in as {bot.user}")
     if not ticker.is_running():
         ticker.start()
@@ -177,32 +211,24 @@ async def on_ready():
 async def _help(ctx: commands.Context):
     msg = (
         "**めるる コマンド**\n"
-        f"プレフィックス: `{PREFIX}`（※**ボス名だけは `!` 省略OK**）\n\n"
+        f"プレフィックス: `{PREFIX}`（※**ボス名だけは `!` 省略OK** / エイリアス & 部分一致対応）\n\n"
         "**登録/設定**\n"
         f"`{PREFIX}addboss <Name> <hours>` 例: `{PREFIX}addboss グラーキ 8`\n"
         f"`{PREFIX}delboss <Name>`\n"
         f"`{PREFIX}interval <Name> <hours>`\n"
         f"`{PREFIX}bosses` 登録済みボス一覧\n"
-        f"`{PREFIX}preset jp` 定義済みの日本向けフィールドボスを**一括登録**\n"
-        f"`{PREFIX}bulkadd <複数行>` まとめて登録（下の使い方を参照）\n\n"
+        f"`{PREFIX}preset jp` プリセット一括登録（＋代表エイリアス）\n"
+        f"`{PREFIX}bulkadd <複数行>` まとめて登録\n\n"
         "**更新/リセット**\n"
         f"`{PREFIX}<BossName>` 討伐(今) → 次回=今+interval  ※`!`省略可\n"
-        f"`{PREFIX}<BossName> HHMM` 例: `{PREFIX}グラーキ 1159` = **11:59に討伐 → 次回=+interval**  ※`!`省略可\n"
-        f"`{PREFIX}reset HHMM` **全ボスの最終討伐時間**を HH:MM に統一（= 各ボスの次回は *討伐時刻 + interval*）。こちらは `!` 必須。\n\n"
+        f"`{PREFIX}<BossName> HHMM` 例: `{PREFIX}鏡 1159` = **11:59に討伐 → 次回=+interval**\n"
+        f"`{PREFIX}reset HHMM` **全ボスの最終討伐時間**を HH:MM に統一\n\n"
         "**表示**\n"
-        f"`{PREFIX}bt [N]` 例: `{PREFIX}bt`, `{PREFIX}bt 3`\n"
-        f"`{PREFIX}bt3` / `{PREFIX}bt6`\n\n"
-        "**bulkadd の使い方**\n"
-        "1メッセージで改行区切りで貼り付け:\n"
-        "```\n"
-        "!bulkadd\n"
-        "グラーキ 8\n"
-        "エンクラ 6\n"
-        "チェルトゥバ 6\n"
-        "```\n"
+        f"`{PREFIX}bt [N]` / `{PREFIX}bt3` / `{PREFIX}bt6`\n\n"
+        "**エイリアス**\n"
+        f"`{PREFIX}alias <別名> <正式名>` / `{PREFIX}unalias <別名>` / `{PREFIX}aliases`\n"
     )
     await ctx.send(msg)
-
 
 @bot.command(name="addboss")
 async def addboss(ctx: commands.Context, name: str, hours: str):
@@ -215,7 +241,6 @@ async def addboss(ctx: commands.Context, name: str, hours: str):
     save_store(store)
     await ctx.send(f"✅ 追加: {name} (リスポーン {interval_h}h)")
 
-
 @bot.command(name="delboss")
 async def delboss(ctx: commands.Context, name: str):
     key = normalize(name)
@@ -225,7 +250,6 @@ async def delboss(ctx: commands.Context, name: str):
         await ctx.send(f"🗑️ 削除: {name}")
     else:
         await ctx.send("未登録のボスです。")
-
 
 @bot.command(name="interval")
 async def set_interval(ctx: commands.Context, name: str, hours: str):
@@ -240,7 +264,6 @@ async def set_interval(ctx: commands.Context, name: str, hours: str):
     save_store(store)
     await ctx.send(f"⏱️ {store[key].name} interval -> {interval_h}h")
 
-
 @bot.command(name="bosses")
 async def bosses(ctx: commands.Context):
     if not store:
@@ -250,22 +273,19 @@ async def bosses(ctx: commands.Context):
         lines.append(f"・{b.name}  / every {b.interval_minutes/60:.2f}h  / next {fmt_dt(b.next_spawn_dt())}  / skip {b.skip_count}")
     await ctx.send("\n".join(lines))
 
-
 @bot.command(name="reset")
 async def reset_all(ctx: commands.Context, hhmm: str):
     base = datetime.now(JST)
     kill_time = hhmm_to_dt(hhmm, base=base)
     if not kill_time:
         return await ctx.send("時刻は HHMM で入力してください。例: 0930")
-    # 全ボスの「最終討伐」を指定時刻に統一 → 次回 = 討伐時刻 + interval
     for b in store.values():
         next_dt = kill_time + timedelta(minutes=b.interval_minutes)
         b.set_next_spawn(next_dt)
         b.skip_count = 0
         b.last_announced_iso = None
     save_store(store)
-    await ctx.send(f"♻️ 全ボスの**最終討伐**を {kill_time.strftime('%H:%M')} に設定 → 次回は各ボスの interval で更新しました。")
-
+    await ctx.send(f"♻️ 全ボスの**最終討伐**を {kill_time.strftime('%H:%M')} に設定 → 次回は各 interval で更新しました。")
 
 @bot.command(name="bt")
 async def bt(ctx: commands.Context, hours: Optional[str] = None):
@@ -277,16 +297,13 @@ async def bt(ctx: commands.Context, hours: Optional[str] = None):
             return await ctx.send("使い方: `!bt` または `!bt 3` (3時間以内)")
     await send_board(ctx.channel, within_hours=within)
 
-
 @bot.command(name="bt3")
 async def bt3(ctx: commands.Context):
     await send_board(ctx.channel, within_hours=3)
 
-
 @bot.command(name="bt6")
 async def bt6(ctx: commands.Context):
     await send_board(ctx.channel, within_hours=6)
-
 
 @bot.command(name="preset")
 async def preset(ctx: commands.Context, key: str):
@@ -299,8 +316,15 @@ async def preset(ctx: commands.Context, key: str):
         store[k] = Boss(name=name, interval_minutes=int(round(h * 60)))
         added += 1
     save_store(store)
-    await ctx.send(f"📦 プリセット `{key}` を登録: {added}件 追加/更新しました。(`!bosses` で確認)")
-
+    # 代表エイリアスも一括登録
+    if key in PRESET_ALIASES:
+        for a, tgt in PRESET_ALIASES[key].items():
+            ak = normalize(a)
+            tk, _ = resolve_boss_key(tgt, store, aliases)
+            if tk:
+                aliases[ak] = tk
+        save_aliases(aliases)
+    await ctx.send(f"📦 プリセット `{key}` を登録: {added}件 追加/更新しました。エイリアスも設定済みです。(`!aliases` で確認)")
 
 @bot.command(name="bulkadd")
 async def bulkadd(ctx: commands.Context, *, body: str = ""):
@@ -310,13 +334,10 @@ async def bulkadd(ctx: commands.Context, *, body: str = ""):
     グラーキ 8
     エンクラ 6
     """
-    # コマンド全文から手動で切り出す（複数行対応）
     content = ctx.message.content
-    # 先頭の "!bulkadd" を除去
     idx = content.lower().find("!bulkadd")
     if idx >= 0:
         body = content[idx + len("!bulkadd"):].strip()
-    # コードブロックがあれば中身だけ抽出
     m = re.search(r"```(.*?)```", body, flags=re.DOTALL)
     if m:
         body = m.group(1).strip()
@@ -341,7 +362,37 @@ async def bulkadd(ctx: commands.Context, *, body: str = ""):
         msg += f"\n⚠️ 失敗: {len(failed)}行 → `{failed[0]}` など（形式: `<名前> <時間>`）"
     await ctx.send(msg)
 
+# --- aliases commands ---
+@bot.command(name="alias")
+async def alias_add(ctx: commands.Context, alias: str, *, target: str):
+    tk, cand = resolve_boss_key(target, store, aliases)
+    if not tk:
+        if cand:
+            return await ctx.send("曖昧です。候補: " + " / ".join(cand))
+        return await ctx.send("そのボスが見つかりません。`!bosses` で確認してください。")
+    aliases[normalize(alias)] = tk
+    save_aliases(aliases)
+    await ctx.send(f"🔗 エイリアス登録: **{alias}** → **{store[tk].name}**")
 
+@bot.command(name="unalias")
+async def alias_del(ctx: commands.Context, alias: str):
+    ak = normalize(alias)
+    if ak in aliases:
+        del aliases[ak]
+        save_aliases(aliases)
+        return await ctx.send(f"🗑️ エイリアス削除: {alias}")
+    await ctx.send("そのエイリアスは登録されていません。")
+
+@bot.command(name="aliases")
+async def alias_list(ctx: commands.Context):
+    if not aliases:
+        return await ctx.send("エイリアスはまだ登録されていません。`!alias 別名 正式名` で追加できます。")
+    items = [f"・{a} → {store[k].name}" for a, k in aliases.items() if k in store]
+    await ctx.send("**エイリアス一覧**\n" + "\n".join(sorted(items)))
+
+# =========================
+# 出力系
+# =========================
 async def send_board(channel: discord.TextChannel, within_hours: Optional[float] = None):
     now = datetime.now(JST)
     rows: List[Boss] = [b for b in store.values() if b.next_spawn_dt()]
@@ -363,7 +414,6 @@ async def send_board(channel: discord.TextChannel, within_hours: Optional[float]
             lines.append(f"・{b.name}{skip} → {fmt_dt(ns)} {rem_s}")
     await channel.send("\n".join(lines))
 
-
 # =========================
 # Quick input (ボス名だけは `!` 省略OK)
 # =========================
@@ -373,34 +423,43 @@ async def boss_quick_update(message: discord.Message):
         return
     if not store:
         return
-    parsed = parse_boss_quick(message.content, list(store.keys()))
-    if not parsed:
+    # 先頭トークンを解析
+    content = message.content.strip()
+    if not content:
         return
-    key, hhmm = parsed
-    now = datetime.now(JST)
+    # `!` 先頭なら剥がす（通常コマンドは別ハンドラに任せる）
+    s = content[1:].lstrip() if content.startswith(PREFIX) else content
+    parts = s.split()
+    if not parts:
+        return
+    name_token = parts[0]
+    # 通常コマンド名ならスキップ
+    if normalize(name_token) in {"addboss","delboss","interval","reset","bt","bt3","bt6","bosses","help","preset","bulkadd","alias","unalias","aliases"}:
+        return
+    key, cand = resolve_boss_key(name_token, store, aliases)
+    if not key:
+        if cand:
+            await message.channel.send("🤔 どれですか？ " + " / ".join(cand))
+        return
     boss = store[key]
-
-    if hhmm:  # HHMM で討伐時刻を指定 → 次回 = 討伐時刻 + interval
-        kill_time = hhmm_to_dt(hhmm, base=now)
+    now = datetime.now(JST)
+    if len(parts) >= 2 and re.fullmatch(r"\d{4}", parts[1]):
+        kill_time = hhmm_to_dt(parts[1], base=now)
         if not kill_time:
-            await message.channel.send("時刻は HHMM で入力してください。例: 0930")
-            return
+            return await message.channel.send("時刻は HHMM で入力してください。例: 0930")
         next_dt = kill_time + timedelta(minutes=boss.interval_minutes)
         boss.set_next_spawn(next_dt)
         boss.skip_count = 0
         boss.last_announced_iso = None
         save_store(store)
-        await message.channel.send(f"⚔️ {boss.name} {kill_time.strftime('%H:%M')} に討伐 → 次回 {fmt_dt(next_dt)}")
-        return
-
-    # 時刻なしは「今討伐」扱い
+        return await message.channel.send(f"⚔️ {boss.name} {kill_time.strftime('%H:%M')} に討伐 → 次回 {fmt_dt(next_dt)}")
+    # 時刻なしは今討伐
     next_dt = now + timedelta(minutes=boss.interval_minutes)
     boss.set_next_spawn(next_dt)
     boss.skip_count = 0
     boss.last_announced_iso = None
     save_store(store)
     await message.channel.send(f"⚔️ {boss.name} 討伐! 次回 {fmt_dt(next_dt)}")
-
 
 # =========================
 # Background ticker – checks every 60s
@@ -431,11 +490,9 @@ async def ticker():
                     f"(討伐入力が無かったため自動スキップしました。`{PREFIX}{b.name} HHMM` または `{PREFIX}{b.name}` で更新可)"
                 )
 
-
 @ticker.before_loop
 async def before_ticker():
     await bot.wait_until_ready()
-
 
 # =========================
 # HTTP keep-alive server (for Render/UptimeRobot)
@@ -462,7 +519,6 @@ async def start_http_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"HTTP server started on :{port}")
-
 
 # =========================
 # Bootstrap
