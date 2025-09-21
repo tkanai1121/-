@@ -1,0 +1,14 @@
+services:
+  - type: web            # HTTP公開（/health 用）
+    name: meruru-boss-bot
+    env: python
+    plan: free
+    region: singapore    # 近いリージョンに変更可
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false      # Renderのダッシュボードで手動入力
+      - key: ANNOUNCE_CHANNEL_ID
+        sync: false
