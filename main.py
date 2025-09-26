@@ -96,8 +96,17 @@ class BossBot(commands.Bot):
         # NOTE: self.tick.start() は setup_hook で開始する（イベントループ起動後）
 
     async def setup_hook(self):
-        # ここならイベントループ起動後なので安全
-        self.tick.start()
+    # ループはここで開始（←既存）
+    self.tick.start()
+
+    # ✅ テキストコマンドを明示登録
+    for attr in (
+        "restart_cmd", "alias", "aliasshow",
+        "bt", "bt3", "bt6", "bt12", "bt24",
+        "reset", "rh", "rhshow",
+    ):
+        self.add_command(getattr(self, attr))
+
 
     # ---- helpers: storage / ids ----
     def _gkey(self, gid: int) -> str:
