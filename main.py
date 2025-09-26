@@ -229,40 +229,52 @@ class BossBot(commands.Bot):
     async def before_tick(self):
         await self.wait_until_ready()
 
-    # ---- events ----
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
-            return
-        parsed = self._parse_input(message.content.strip())
-        if parsed:
-            raw, when_jst, respawn_min_override = parsed
-            canonical = self._resolve_alias(message.guild.id, raw)
-            if not canonical:
-                await message.reply(
-                    f"ボス名を特定できません：`{raw}`\n`!aliasshow` で候補確認、または `!alias {raw} 正式名` で登録してください。",
-                    mention_author=False
-                )
-                return
-            gkey = self._gkey(message.guild.id)
-            g = self.data.get(gkey, {})
-            st = BossState(name=canonical, respawn_min=60)
-            if canonical in self.presets:
-                st.respawn_min, st.rate = self.presets[canonical]
-            if canonical in g:
-                st = BossState(**g[canonical])
-            if respawn_min_override:
-                st.respawn_min = respawn_min_override
-            st.channel_id = st.channel_id or message.channel.id
-            center = when_jst.astimezone(timezone.utc) + timedelta(
-                minutes=st.respawn_min + st.initial_delay_min
-            )
-            st.next_spawn_utc = int(center.timestamp())
-            st.skip = 0
-            self._set(message.guild.id, st)
-            await message.add_reaction("✅")
-            return
-        await self.process_commands(message)
+# ---- events ----
+async def on_message(self, message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
 
+    content = message.content.strip()
+
+    # ✅ ここを追加：先頭が '!' のときは「コマンド優先」
+    if content.startswith('!'):
+        await self.process_commands(message)
+        return
+
+    # （以下は討伐入力の高速処理）
+    parsed = self._parse_input(content)
+    if parsed:
+        raw, when_jst, respawn_min_override = parsed
+        canonical = self._resolve_alias(message.guild.id, raw)
+        if not canonical:
+            await message.reply(
+                f"ボス名を特定できません：`{raw}`\n`!aliasshow` で候補確認、または `!alias {raw} 正式名` で登録してください。",
+                mention_author=False
+            )
+            return
+        gkey = self._gkey(message.guild.id)
+        g = self.data.get(gkey, {})
+        st = BossState(name=canonical, respawn_min=60)
+        if canonical in self.presets:
+            st.respawn_min, st.rate = self.presets[canonical]
+        if canonical in g:
+            st = BossState(**g[canonical])
+        if respawn_min_override:
+            st.respawn_min = respawn_min_override
+        st.channel_id = st.channel_id or message.channel.id
+        center = when_jst.astimezone(timezone.utc) + timedelta(
+            minutes=st.respawn_min + st.initial_delay_min
+        )
+        st.next_spawn_utc = int(center.timestamp())
+        st.skip = 0
+        self._set(message.guild.id, st)
+        await message.add_reaction("✅")
+        return
+
+    # 念のため：ここにも残しておいてOK（上の return で二重実行は回避される）
+    await self.process_commands(message)
+
+    
     # ---- commands ----
     @commands.command(name="restart")
     async def restart_cmd(self, ctx: commands.Context):
