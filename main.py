@@ -94,8 +94,10 @@ class BossBot(discord.Client):
         self.alias_map: Dict[str, Dict[str, str]] = {}                # guild -> norm -> canonical
         self._load_presets()
         self._seed_alias = self._build_seed_alias()
+        # ここでは tick.start() を呼ばない（ループ未起動のため）
 
-        # 背景監視
+    async def setup_hook(self):
+        """イベントループ起動後に呼ばれる。ここでタスク開始。"""
         self.tick.start()
 
     # ---- helpers ----
@@ -258,7 +260,7 @@ class BossBot(discord.Client):
 
         content = message.content.strip()
 
-        # 1) '!' コマンドは手動パースで確実に処理
+        # 1) '!' コマンドを手動パース
         if content.startswith('!'):
             parts = content[1:].split()
             if not parts:
@@ -266,15 +268,15 @@ class BossBot(discord.Client):
             cmd = parts[0].lower()
             args = parts[1:]
             try:
-                if cmd in ("bt",):
+                if cmd == "bt":
                     await self._send_bt_message(message.channel, message.guild.id, None)
-                elif cmd in ("bt3",):
+                elif cmd == "bt3":
                     await self._send_bt_message(message.channel, message.guild.id, 3)
-                elif cmd in ("bt6",):
+                elif cmd == "bt6":
                     await self._send_bt_message(message.channel, message.guild.id, 6)
-                elif cmd in ("bt12",):
+                elif cmd == "bt12":
                     await self._send_bt_message(message.channel, message.guild.id, 12)
-                elif cmd in ("bt24",):
+                elif cmd == "bt24":
                     await self._send_bt_message(message.channel, message.guild.id, 24)
                 elif cmd == "rhshow":
                     kw = " ".join(args) if args else None
@@ -317,14 +319,11 @@ class BossBot(discord.Client):
                     self.store.save(self.data)
                     await self.close()
                     os._exit(1)
-                else:
-                    # 未対応コマンドは無視
-                    pass
             except Exception as e:
                 await message.channel.send(f"エラー: {e}")
             return
 
-        # 2) 討伐入力の高速処理
+        # 2) 討伐入力
         parsed = self._parse_kill_input(content)
         if parsed:
             raw, when_jst, respawn_min_override = parsed
@@ -335,13 +334,9 @@ class BossBot(discord.Client):
                     mention_author=False
                 )
                 return
-            gkey = self._gkey(message.guild.id)
-            g = self.data.get(gkey, {})
-            st = BossState(name=canonical, respawn_min=60)
+            st = self._get(message.guild.id, canonical) or BossState(name=canonical, respawn_min=60)
             if canonical in self.presets:
                 st.respawn_min, st.rate = self.presets[canonical]
-            if canonical in g:
-                st = BossState(**g[canonical])
             if respawn_min_override:
                 st.respawn_min = respawn_min_override
             st.channel_id = st.channel_id or message.channel.id
@@ -385,3 +380,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
