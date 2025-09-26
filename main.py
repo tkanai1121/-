@@ -85,6 +85,7 @@ def now_utc() -> datetime:
 class BossBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True   # ←これを追加
         super().__init__(command_prefix="!", intents=intents)
         self.store = Store(STORE_FILE)
         self.data: Dict[str, Dict[str, dict]] = self.store.load()   # guild -> name -> dict
