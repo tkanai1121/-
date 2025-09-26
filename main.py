@@ -1,58 +1,5 @@
-# Lineage2M ボス通知 Discord Bot（JST固定 / Render無料運用版）
+# -*- coding: utf-8 -*-
 
-> **要約**
->
-> * 目的：討伐記録 → 次回湧き自動計算 → **1分前＆出現時**をまとめて通知。
-> * 入力：`ボス名 HHMM [周期h]` または `ボス名`（時刻省略=入力時刻）。未来HHMMは**前日討伐**扱い。
-> * 一覧：`!bt` / `!bt3` / `!bt6` / `!bt12` / `!bt24`（直近X時間）。時間帯（HH）ごとに**段落化**して視認性UP。
-> * 通知：±1分内に複数あれば**1メッセージに集約**。出現率100%は **「※確定」** を付与。
-> * 運用：Render（無料）+ GitHub + cron-job.org のヘルスチェックで**24h安定**。
-> * タイムゾーン：**Asia/Tokyo (JST)** 固定。保存はUTC。
-
----
-
-## 0) 事前準備
-
-* Discord 側 Bot TOKEN を環境変数 `DISCORD_TOKEN` に設定。
-* 権限は `Send Messages` / `Read Message History` だけでOK。
-
----
-
-## 1) プロジェクト構成
-
-```
-lineage2m-bossbot/
-├─ main.py                # Discord Bot本体 + FastAPI keepalive + 予約通知
-├─ bosses_preset.json     # 出現率＆既定周期（h）
-├─ data/
-│   └─ store.json         # 自動生成（ギルド別の状態）
-├─ requirements.txt
-├─ render.yaml            # Renderデプロイ定義（Web Service 1本）
-└─ README.md
-```
-
----
-
-## 2) 機能ハイライト
-
-* **通知**：⏰ 1分前 / 🔥 出現時。±60秒に重なったら1メッセージにまとめる。
-* **skip管理**：入力なし→次周に自動スライド＆skip++。
-* **一覧**：`!bt` 系コマンドで直近を時台ごとに段落化表示。
-* **周期変更**：`!rh` / `!rhshow`。
-* **プリセット**：`!preset` で再読込。
-* **再起動**：`!restart` 誰でも可能。データは `store.json` に保存されるため継続。
-* **エイリアス**：
-
-  * 正規化（ひらがな/カタカナ/半角/全角/小文字）
-  * 一部一致補完（ユニークな場合のみ）
-  * ローマ字略称対応（例：`qa`→クイーンアント）
-  * ユーザー定義：`!alias` / `!aliasshow`
-
----
-
-## 3) main.py
-
-```python
 import os, json, re, gc, unicodedata, asyncio
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
