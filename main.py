@@ -2,10 +2,11 @@
 import os, json, re, gc, unicodedata, asyncio
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, 
+from typing import Dict, List, Optional, Tuple
+
 import discord
 from discord.ext import tasks
-from fastapi import FastAP
+from fastapi import FastAPI
 from uvicorn import Config, Server
 
 # ====== CONST ======
@@ -53,6 +54,9 @@ class BossState:
     skip: int = 0
     excluded_reset: bool = False
     initial_delay_min: int = 0
+    # 通知重複防止フラグ（この湧き=next_spawn_utcに対して送信済みか）
+    notified_pre_for: Optional[int] = None     # 1分前を送った next_spawn_utc
+    notified_spawn_for: Optional[int] = None   # 出現を送った next_spawn_utc
 
     def label_flags(self) -> str:
         parts = []
@@ -88,18 +92,18 @@ class BossBot(discord.Client):
         super().__init__(intents=intents)
 
         self.store = Store(STORE_FILE)
-        self.data: Dict[str, Dict[str, dict]] = self.store.load()     # guild -> name -> dict
+        self.data: Dict[str, Dict[str, dict]] = self.store.load()     # guild -> name -> dict / "__cfg__"
         self.presets: Dict[str, Tuple[int, int]] = {}                 # name -> (respawn_min, rate)
         self.alias_map: Dict[str, Dict[str, str]] = {}                # guild -> norm -> canonical
         self._load_presets()
         self._seed_alias = self._build_seed_alias()
-        # ここでは tick.start() を呼ばない（ループ未起動のため）
+        # tick は setup_hook で開始する
 
     async def setup_hook(self):
         """イベントループ起動後に呼ばれる。ここでタスク開始。"""
         self.tick.start()
 
-    # ---- helpers ----
+    # ---- helpers: storage / ids ----
     def _gkey(self, gid: int) -> str:
         return str(gid)
     def _get(self, gid: int, name: str) -> Optional[BossState]:
@@ -112,7 +116,37 @@ class BossBot(discord.Client):
         self.data[gkey][st.name] = asdict(st)
         self.store.save(self.data)
     def _all(self, gid: int) -> List[BossState]:
-        return [BossState(**d) for d in self.data.get(self._gkey(gid), {}).values()]
+        g = self.data.get(self._gkey(gid), {})
+        out: List[BossState] = []
+        for k, d in g.items():
+            if k == "__cfg__":
+                continue
+            if isinstance(d, dict) and "respawn_min" in d:
+                out.append(BossState(**d))
+        return out
+
+    # ---- guild config: allowed channels ----
+    def _cfg(self, gid: int) -> dict:
+        gkey = self._gkey(gid)
+        g = self.data.setdefault(gkey, {})
+        cfg = g.get("__cfg__")
+        if not cfg:
+            cfg = {"channels": []}  # 明示登録チャンネルのみ許可
+            g["__cfg__"] = cfg
+            self.store.save(self.data)
+        return cfg
+    def _is_channel_enabled(self, gid: int, channel_id: int) -> bool:
+        return channel_id in self._cfg(gid).get("channels", [])
+    def _enable_channel(self, gid: int, channel_id: int):
+        cfg = self._cfg(gid)
+        if channel_id not in cfg["channels"]:
+            cfg["channels"].append(channel_id)
+            self.store.save(self.data)
+    def _disable_channel(self, gid: int, channel_id: int):
+        cfg = self._cfg(gid)
+        if channel_id in cfg["channels"]:
+            cfg["channels"].remove(channel_id)
+            self.store.save(self.data)
 
     # ---- presets / alias ----
     def _load_presets(self):
@@ -183,27 +217,44 @@ class BossBot(discord.Client):
                 continue
             pre_items: Dict[int, List[str]] = {}
             now_items: Dict[int, List[str]] = {}
-            for d in bosses.values():
+
+            for key, d in bosses.items():
+                if key == "__cfg__":
+                    continue
                 st = BossState(**d)
                 if not st.channel_id or not st.next_spawn_utc:
                     continue
+
                 center = datetime.fromtimestamp(st.next_spawn_utc, tz=timezone.utc)
-                # 1分前
-                if abs((now - (center - timedelta(minutes=1))).total_seconds()) <= MERGE_WINDOW_SEC:
+                pre_time = center - timedelta(minutes=1)
+
+                # 1分前（この湧きで未送信なら送る）
+                if (st.notified_pre_for != st.next_spawn_utc and
+                    abs((now - pre_time).total_seconds()) <= MERGE_WINDOW_SEC):
                     pre_items.setdefault(st.channel_id, []).append(
                         f"{center.astimezone(JST).strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".strip()
                     )
-                # 出現
-                if abs((now - center).total_seconds()) <= MERGE_WINDOW_SEC:
+                    st.notified_pre_for = st.next_spawn_utc
+                    self._set(int(gkey), st)
+
+                # 出現（この湧きで未送信なら送る）
+                if (st.notified_spawn_for != st.next_spawn_utc and
+                    abs((now - center).total_seconds()) <= MERGE_WINDOW_SEC):
                     now_items.setdefault(st.channel_id, []).append(
                         f"{st.name} 出現！ [{center.astimezone(JST).strftime('%H:%M:%S')}] (skip:{st.skip}) {st.label_flags()}".strip()
                     )
-                # スライド
+                    st.notified_spawn_for = st.next_spawn_utc
+                    self._set(int(gkey), st)
+
+                # 出現から1分経過 → 次周へスライド（フラグもリセット）
                 if (now - center).total_seconds() >= 60:
                     st.next_spawn_utc += st.respawn_min * 60
                     st.skip += 1
+                    st.notified_pre_for = None
+                    st.notified_spawn_for = None
                     self._set(int(gkey), st)
-            # 送信
+
+            # 送信（チャンネルごとに1メッセージ）
             for cid, arr in pre_items.items():
                 ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
                 await ch.send("⏰ 1分前 " + "\n".join(sorted(arr)))
@@ -259,7 +310,7 @@ class BossBot(discord.Client):
 
         content = message.content.strip()
 
-        # 1) '!' コマンドを手動パース
+        # 1) '!' コマンド（どのチャンネルでも受け付け）
         if content.startswith('!'):
             parts = content[1:].split()
             if not parts:
@@ -298,6 +349,8 @@ class BossBot(discord.Client):
                         center = base + timedelta(minutes=st.respawn_min + st.initial_delay_min)
                         st.next_spawn_utc = int(center.astimezone(timezone.utc).timestamp())
                         st.skip = 0
+                        st.notified_pre_for = None
+                        st.notified_spawn_for = None
                         self._set(message.guild.id, st)
                     await message.channel.send(f"全体を {base.strftime('%H:%M')} リセットしました。")
                 elif cmd == "alias" and len(args) >= 2:
@@ -312,6 +365,19 @@ class BossBot(discord.Client):
                     else:
                         lines = [f"• {k} → {v}" for k, v in sorted(g_alias.items())]
                         await message.channel.send("\n".join(lines))
+                # 受け付けチャンネル制御
+                elif cmd in ("hereon", "enablehere", "watchon"):
+                    self._enable_channel(message.guild.id, message.channel.id)
+                    await message.channel.send("✅ このチャンネルを討伐入力の受け付け対象にしました。")
+                elif cmd in ("hereoff", "disablehere", "watchoff"):
+                    self._disable_channel(message.guild.id, message.channel.id)
+                    await message.channel.send("✅ このチャンネルを受け付け対象から外しました。")
+                elif cmd in ("hereshow", "watchshow"):
+                    cids = self._cfg(message.guild.id).get("channels", [])
+                    if not cids:
+                        await message.channel.send("（受け付けチャンネル未設定）")
+                    else:
+                        await message.channel.send("受け付け中: " + " ".join(f"<#{cid}>" for cid in cids))
                 elif cmd == "restart":
                     await message.channel.send("♻️ Botを再起動します...")
                     gc.collect()
@@ -322,16 +388,16 @@ class BossBot(discord.Client):
                 await message.channel.send(f"エラー: {e}")
             return
 
-        # 2) 討伐入力
+        # 2) 討伐入力（許可チャンネル以外は完全無視）
+        if not self._is_channel_enabled(message.guild.id, message.channel.id):
+            return
+
         parsed = self._parse_kill_input(content)
         if parsed:
             raw, when_jst, respawn_min_override = parsed
             canonical = self._resolve_alias(message.guild.id, raw)
             if not canonical:
-                await message.reply(
-                    f"ボス名を特定できません：`{raw}`\n`!aliasshow` で候補確認、または `!alias {raw} 正式名` で登録してください。",
-                    mention_author=False
-                )
+                # ボス名不明時は黙って無視（誤爆対策）
                 return
             st = self._get(message.guild.id, canonical) or BossState(name=canonical, respawn_min=60)
             if canonical in self.presets:
@@ -344,6 +410,8 @@ class BossBot(discord.Client):
             )
             st.next_spawn_utc = int(center.timestamp())
             st.skip = 0
+            st.notified_pre_for = None
+            st.notified_spawn_for = None
             self._set(message.guild.id, st)
             await message.add_reaction("✅")
 
