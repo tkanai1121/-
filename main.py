@@ -92,6 +92,10 @@ class BossBot(commands.Bot):
         self.alias_map: Dict[str, Dict[str, str]] = {}              # guild -> norm -> canonical
         self._load_presets()
         self._seed_alias = self._build_seed_alias()
+        # NOTE: self.tick.start() は setup_hook で開始する（イベントループ起動後）
+
+    async def setup_hook(self):
+        # ここならイベントループ起動後なので安全
         self.tick.start()
 
     # ---- helpers: storage / ids ----
