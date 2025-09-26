@@ -2,11 +2,10 @@
 import os, json, re, gc, unicodedata, asyncio
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
-
+from typing import Dict, List, Optional, 
 import discord
 from discord.ext import tasks
-from fastapi import FastAPI
+from fastapi import FastAP
 from uvicorn import Config, Server
 
 # ====== CONST ======
