@@ -1,335 +1,442 @@
-# app.py
-import os
-import re
-import json
-import asyncio
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+# -*- coding: utf-8 -*-
+"""
+Discord BossBot (Render/Glitch対応)
+- 入力: 「ボス名 HHMM [周期h]」…HHMMは24h表記、周期未指定ならプリセット/既存値
+- プリセット: !preset jp（出現率つき/日本語名）
+- 一覧: bt / bt3 / bt6 / bt12 / bt24
+  - 表示は「HH:MM:SS : ボス名 [n周]/※確定 (skip:x)」
+  - 時（HH）が変わるたび空行3つで段落化
+- 通知:
+  - 出現1分前のみ（±30秒補正）
+  - ±1分以内に同時湧きは1通にまとめて送信
+  - 出現率100%のみ「※確定」マーク
+  - スキップ時の通知は出さない（内部skipカウントのみ進行）
+- 設定:
+  !setchannel（通知チャンネル指定）
+  !reset HHMM（全ボスを指定時刻基準に再設定）
+  !rh ボス名 h（周期だけ変更）
+  !rhshow [kw]（周期＋出現率の一覧）
+- /health: 204 No Content（軽量ヘルスチェック）
 
+環境変数:
+  DISCORD_TOKEN  … Discord Bot Token
+"""
+
+import os, re, json, threading
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from flask import Flask, Response
 import discord
 from discord.ext import commands, tasks
-from flask import Flask, jsonify
 
-from storage import load_json, save_json, ensure_data_dir
-from presets import JP_PRESET
+# ===== タイムゾーン & 時刻ユーティリティ =====
+JST = ZoneInfo("Asia/Tokyo")
+def now() -> datetime:
+    return datetime.now(tz=JST)
 
-# ---- 基本設定 ----
-TOKEN = os.getenv("DISCORD_TOKEN")  # RenderのEnvironmentに設定
-TZ = timezone(timedelta(hours=9))   # JST
-DATA_DIR = "data"
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
-PERIODS_FILE = os.path.join(DATA_DIR, "periods.json")
-DEFAULT_NOTIFY_WINDOW_MIN = 3       # bt3 の既定
-GROUP_WINDOW_SEC = 60               # 同時沸きの定義（±1分）
-PRE_NOTIFY_SEC = 60                 # 出現 1分前 通知
+def fmt_hms(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%H:%M:%S")  # 表示は秒付き
 
-# ---- Flask keep-alive ----
-flask_app = Flask(__name__)
+def fmt_ymdhm(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")  # 永続は分まで
 
-@flask_app.get("/health")
-def health():
-    state = load_json(STATE_FILE, default={})
-    return jsonify({"ok": True, "bosses": len(state.get("bosses", {}))})
+def parse_hhmm_today(hhmm: str) -> datetime:
+    h = int(hhmm[:2]); m = int(hhmm[2:])
+    return datetime(now().year, now().month, now().day, h, m, tzinfo=JST)
 
-def run_flask():
-    port = int(os.getenv("PORT", "10000"))
-    flask_app.run(host="0.0.0.0", port=port)
-
-# ---- Discord ----
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
-# ---- 状態管理 ----
-def now():
-    return datetime.now(TZ)
-
-def parse_hhmm(s: str) -> datetime | None:
-    m = re.fullmatch(r"(\d{2})(\d{2})", s)
-    if not m:
-        return None
-    hh, mm = int(m.group(1)), int(m.group(2))
-    today = now().date()
-    dt = datetime(today.year, today.month, today.day, hh, mm, tzinfo=TZ)
-    # 未来入力は「前日討伐扱い」
-    if dt > now():
-        dt -= timedelta(days=1)
-    return dt
-
-def hours_to_timedelta(hstr: str) -> timedelta | None:
+def parse_ymdhm(s: str):
     try:
-        return timedelta(hours=float(hstr))
+        return datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=JST)
     except Exception:
         return None
 
-# state.json の構造
-# {
-#   "channel_id": 1234567890 or null,
-#   "bosses": {
-#       "エンクラ": {"next_at": "2025-09-25T19:35:00+09:00", "period_h": 3.5, "skip": 0},
-#       ...
-#   }
-# }
-def load_state():
-    return load_json(STATE_FILE, default={"channel_id": None, "bosses": {}})
+# ===== 表示幅（全角=2）ユーティリティ =====
+try:
+    from wcwidth import wcwidth
+except Exception:
+    def wcwidth(ch: str) -> int:
+        code = ord(ch)
+        return 2 if (
+            0x1100 <= code <= 0x115F or
+            0x2E80 <= code <= 0xA4CF or
+            0xAC00 <= code <= 0xD7A3 or
+            0xF900 <= code <= 0xFAFF or
+            0xFE10 <= code <= 0xFE19 or
+            0xFE30 <= code <= 0xFE6F or
+            0xFF00 <= code <= 0xFF60 or
+            0xFFE0 <= code <= 0xFFE6
+        ) else 1
 
-def save_state(state):
-    save_json(STATE_FILE, state)
+def visual_len(s: str) -> int:
+    return sum(wcwidth(ch) for ch in s)
 
-def load_periods():
-    # periods.json: {"エンクラ": {"period_h": 3.5, "chance": 50}, ...}
-    return load_json(PERIODS_FILE, default={})
+def pad_to(s: str, width: int) -> str:
+    cur = visual_len(s)
+    return s if cur >= width else s + " " * (width - cur)
 
-def save_periods(periods):
-    save_json(PERIODS_FILE, periods)
+# ===== 永続化 =====
+SAVE_PATH = "data.json"
+state = {
+    "notify_channel_id": None,
+    "bosses": {
+        # "ボス": {
+        #   "respawn_h": float,        # 周期
+        #   "rate": int,               # 出現率（%）
+        #   "last_kill": "YYYY-MM-DD HH:MM",
+        #   "next_spawn": "YYYY-MM-DD HH:MM",
+        #   "skip_count": int,
+        #   "rem1": bool               # 1分前通知済フラグ
+        # }
+    }
+}
 
-def chance_mark(name: str) -> str:
-    periods = load_periods()
-    c = periods.get(name, {}).get("chance")
-    if c is None:
-        return ""
-    mark = "※確定" if c >= 100 else f"({c}%)"
-    return mark
-
-def ensure_boss(state, name):
-    if name not in state["bosses"]:
-        state["bosses"][name] = {"next_at": None, "period_h": None, "skip": 0}
-
-def set_next_from_kill(state, name, killed_at: datetime, period_h: float | None):
-    ensure_boss(state, name)
-    periods = load_periods()
-    if period_h is None:
-        # プリセットがあれば既定値
-        p = periods.get(name, {}).get("period_h")
-    else:
-        p = period_h
-        # ユーザが明示したら periods にも反映（学習）
-        periods[name] = periods.get(name, {})
-        periods[name]["period_h"] = float(period_h)
-        if "chance" not in periods[name]:
-            periods[name]["chance"] = 100 if float(period_h) == int(period_h) else 50
-        save_periods(periods)
-
-    if p is None:
-        return False
-    nxt = killed_at + timedelta(hours=float(p))
-    state["bosses"][name]["next_at"] = nxt.isoformat()
-    state["bosses"][name]["period_h"] = float(p)
-    state["bosses"][name]["skip"] = 0
-    save_state(state)
-    return True
-
-def bump_skip_if_passed(state):
-    """予定時刻を過ぎたボスは、スキップ（通知はしない）"""
-    changed = False
-    nowt = now()
-    for name, b in state["bosses"].items():
-        na = b.get("next_at")
-        per = b.get("period_h")
-        if not na or not per:
-            continue
-        nat = datetime.fromisoformat(na)
-        while nat <= nowt:
-            nat += timedelta(hours=float(per))
-            b["skip"] = int(b.get("skip", 0)) + 1
-            changed = True
-        if nat.isoformat() != b["next_at"]:
-            b["next_at"] = nat.isoformat()
-            changed = True
-    if changed:
-        save_state(state)
-
-def hour_bucket(dt: datetime) -> str:
-    return dt.strftime("%H")
-
-def build_list_message(state, hours=DEFAULT_NOTIFY_WINDOW_MIN):
-    bosses = state["bosses"]
-    nowt = now()
-    lim = nowt + timedelta(hours=hours)
-
-    # 期間内のボスを抽出
-    items = []
-    for name, b in bosses.items():
-        na = b.get("next_at")
-        if not na:
-            continue
-        nat = datetime.fromisoformat(na)
-        if nowt <= nat <= lim:
-            items.append((name, nat, int(b.get("skip", 0))))
-
-    if not items:
-        return "該当なし"
-
-    # 時間帯で段落化（時:）
-    items.sort(key=lambda x: x[1])
-    lines = ["```", f"----- In {hours}hours Boss Time -----"]
-    current_hour = None
-    for name, nat, skip in items:
-        hh = hour_bucket(nat)
-        if current_hour is None:
-            current_hour = hh
-            lines.append("")
-            lines.append(f"{hh}:00台")
-        elif hh != current_hour:
-            # 段落区切り（空行3つ）
-            lines.extend(["", "", ""])
-            current_hour = hh
-            lines.append(f"{hh}:00台")
-
-        mark = chance_mark(name)
-        tstr = nat.strftime("%H:%M:%S")
-        sk = f"【スキップ{skip}回】" if skip else ""
-        # 例: 17:35:13 : エンクラ(50%)【スキップ3回】
-        lines.append(f"{tstr} : {name}{mark}{sk}")
-    lines.append("```")
-    return "\n".join(lines)
-
-async def safe_send(channel: discord.TextChannel, content: str):
+def load():
+    global state
     try:
-        await channel.send(content)
+        with open(SAVE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        save()
+
+def save():
+    with open(SAVE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+# ===== JPプリセット（間隔h, 出現率%） =====
+JP_PRESET: dict[str, tuple[float, int]] = {
+    "フェリス": (2.0, 50), "バシラ": (2.5, 50), "パンナロード": (3.0, 50),
+    "エンクラ": (3.5, 50), "テンペスト": (3.5, 50), "マトゥラ": (4.0, 50),
+    "チェトゥルゥバ": (3.0, 50), "ブレカ": (4.0, 50), "クイーンアント": (6.0, 33),
+    "ヒシルローメ": (6.0, 50), "レピロ": (5.0, 33), "トロンバ": (4.5, 50),
+    "スタン": (4.0, 100), "ミュータントクルマ": (8.0, 100),
+    "ティミトリス": (5.0, 100), "汚染したクルマ": (8.0, 100),
+    "タルキン": (5.0, 50), "ティミニエル": (8.0, 100), "グラーキ": (8.0, 100),
+    "忘却の鏡": (12.0, 100), "ガレス": (6.0, 50), "ベヒモス": (6.0, 100),
+    "ランドール": (8.0, 100), "ケルソス": (6.0, 50), "タラキン": (7.0, 100),
+    "メデューサ": (7.0, 100), "サルカ": (7.0, 100), "カタン": (8.0, 100),
+    "コアサセプタ": (12.0, 33), "ブラックリリー": (12.0, 100),
+    "パンドライド": (8.0, 100), "サヴァン": (12.0, 100),
+    "ドラゴンビースト": (12.0, 50), "バルポ": (8.0, 50), "セル": (7.5, 33),
+    "コルーン": (10.0, 100), "オルフェン": (24.0, 33), "サミュエル": (12.0, 100),
+    "アンドラス": (12.0, 50), "カブリオ": (12.0, 50), "ハーフ": (24.0, 33),
+    "フリント": (8.0, 33),
+}
+DEFAULT_RH = 8.0
+
+def get_rh(name: str) -> float:
+    b = state["bosses"].get(name)
+    if b and "respawn_h" in b:
+        return float(b["respawn_h"])
+    if name in JP_PRESET:
+        return JP_PRESET[name][0]
+    return DEFAULT_RH
+
+def get_rate(name: str) -> int | None:
+    b = state["bosses"].get(name)
+    if b and "rate" in b:
+        return int(b["rate"])
+    if name in JP_PRESET:
+        return JP_PRESET[name][1]
+    return None
+
+def set_rh(name: str, h: float):
+    info = state["bosses"].setdefault(name, {})
+    info["respawn_h"] = float(h)
+
+# ===== Discord Bot =====
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print("✅ Logged in as", bot.user)
+    load()
+    if not ticker.is_running():
+        ticker.start()
+
+async def notify(text: str):
+    ch_id = state.get("notify_channel_id")
+    if not ch_id:
+        return
+    try:
+        ch = await bot.fetch_channel(int(ch_id))
+        await ch.send(text)
     except Exception:
         pass
 
+def set_next_spawn(name: str, base: datetime, rh: float):
+    info = state["bosses"].setdefault(name, {})
+    info["next_spawn"] = fmt_ymdhm(base + timedelta(hours=rh))
+    info["rem1"] = False
+    info["skip_count"] = int(info.get("skip_count") or 0)
+
+TIME_RE = re.compile(r"^(.+?)\s+(\d{3,4})(?:\s+(\d+(?:\.\d+)?))?$")
+
 # ---- コマンド ----
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    ensure_data_dir()
-    # 初回起動で periods が無ければ JP を焼く
-    if not load_periods():
-        save_periods(JP_PRESET)
-    notifier.start()
+@bot.command()
+async def setchannel(ctx):
+    state["notify_channel_id"] = str(ctx.channel.id)
+    save()
+    await ctx.reply("✅ 通知チャンネルを設定しました。")
 
 @bot.command()
-@commands.has_permissions(manage_channels=True)
-async def setchannel(ctx: commands.Context):
-    """現在のチャンネルを通知先に設定（管理者のみ）"""
-    state = load_state()
-    state["channel_id"] = ctx.channel.id
-    save_state(state)
-    await ctx.reply("通知チャンネルを登録しました。")
+async def reset(ctx, hhmm: str = None):
+    if not hhmm or not re.fullmatch(r"\d{4}", hhmm):
+        return await ctx.reply("使い方: `!reset HHMM`")
+    base = parse_hhmm_today(hhmm)
+    target = base if base > now() else base + timedelta(days=1)
+    for info in state["bosses"].values():
+        info["next_spawn"] = fmt_ymdhm(target)
+        info["rem1"] = False
+        info["skip_count"] = 0
+    save()
+    await ctx.reply(f"♻️ 全ボスを **{target.strftime('%m/%d %H:%M')}** に再設定しました。")
 
 @bot.command()
-async def preset(ctx: commands.Context, name: str = "jp"):
-    """!preset jp を適用"""
-    if name.lower() != "jp":
-        await ctx.reply("利用可能: jp")
-        return
-    save_periods(JP_PRESET)
-    await ctx.reply("JPプリセットを適用しました。")
-
-@bot.command(aliases=["bt"])
-async def bt_hours(ctx: commands.Context, hours: str = "3"):
-    """bt / bt3 / bt6 / bt12 / bt24"""
-    if hours.startswith("bt"):
-        hours = hours[2:]
+async def rh(ctx, name: str = None, hours: str = None):
+    if not name or not hours:
+        return await ctx.reply("使い方: `!rh ボス名 時間h`")
     try:
-        h = int(hours)
-    except Exception:
-        h = DEFAULT_NOTIFY_WINDOW_MIN
-    msg = build_list_message(load_state(), hours=h)
-    await ctx.reply(msg)
+        h = float(hours)
+    except ValueError:
+        return await ctx.reply("時間h は数値で指定してください。")
+    set_rh(name, h)
+    save()
+    await ctx.reply(f"🔧 {name} の周期を {h}h に設定しました。")
 
-# ショート入力: 「ボス名 HHMM [周期h]」
+@bot.command()
+async def rhshow(ctx, kw: str = None):
+    names = set(JP_PRESET.keys()) | set(state["bosses"].keys())
+    rows = []
+    for n in sorted(names):
+        if kw and kw not in n:
+            continue
+        rh = get_rh(n)
+        rate = get_rate(n)
+        rows.append(f"{n} : {rh}h / 出現率 {rate}%" if rate else f"{n} : {rh}h")
+    if not rows:
+        return await ctx.reply("（該当なし）")
+    await ctx.send("```\n" + "\n".join(rows) + "\n```")
+
+@bot.command()
+async def preset(ctx, which: str = None):
+    if not which or which.lower() != "jp":
+        return await ctx.reply("対応プリセット: jp")
+    now_dt = now()
+    for n, (h, rate) in JP_PRESET.items():
+        info = state["bosses"].setdefault(n, {})
+        info["respawn_h"] = float(h)
+        info["rate"] = int(rate)
+        # 既に次湧きが無ければ、とりあえず今＋周期で初期化
+        if not info.get("next_spawn"):
+            info["next_spawn"] = fmt_ymdhm(now_dt + timedelta(hours=h))
+        info.setdefault("skip_count", 0)
+        info["rem1"] = False
+    save()
+    await ctx.reply("✅ JPプリセットを読み込みました。")
+
+# ---- メッセージ（ショート入力 & 一覧） ----
 @bot.event
 async def on_message(message: discord.Message):
+    await bot.process_commands(message)
     if message.author.bot:
         return
 
     content = message.content.strip()
-    # 例: 「エンクラ 1935 4.5」 / 「トロンバ 1120」
-    m = re.fullmatch(r"(.+?)\s+(\d{4})(?:\s+([0-9]*\.?[0-9]+)h?)?$", content)
+    low = content.lower()
+
+    # 一覧
+    if low in {"bt3", "bt 3"}:
+        return await send_list(message.channel, 3)
+    if low in {"bt6", "bt 6"}:
+        return await send_list(message.channel, 6)
+    if low in {"bt12", "bt 12"}:
+        return await send_list(message.channel, 12)
+    if low in {"bt24", "bt 24"}:
+        return await send_list(message.channel, 24)
+    if low in {"bt", "btall", "bl"}:
+        return await send_list(message.channel, None)
+
+    # ショート入力: 「ボス名 HHMM [周期h]」
+    m = TIME_RE.match(content)
     if m:
-        name = m.group(1).strip()
-        hhmm = m.group(2)
-        per = m.group(3)
+        name, hhmm, opt = m.groups()
+        if len(hhmm) == 3:
+            hhmm = "0" + hhmm
+        if not re.fullmatch(r"\d{4}", hhmm):
+            return await message.reply("⛔ 時刻はHHMMで指定してください。")
 
-        killed = parse_hhmm(hhmm)
-        if not killed:
-            await message.reply("時刻はHHMMで入力してください（例: 1935）")
-            return
+        rh = get_rh(name)
+        if opt:
+            try:
+                rh = float(opt)
+                set_rh(name, rh)
+            except ValueError:
+                pass
 
-        period_td = None
-        per_h = None
-        if per:
-            td = hours_to_timedelta(per)
-            if not td:
-                await message.reply("周期は 4 / 4.5 / 8 などで指定してください")
-                return
-            period_td = td
-            per_h = float(per)
+        kill = parse_hhmm_today(hhmm)
+        if kill > now():  # 未来は前日討伐扱い
+            kill -= timedelta(days=1)
 
-        st = load_state()
-        ok = set_next_from_kill(st, name, killed, per_h)
-        if not ok:
-            await message.reply("周期が不明です。`!preset jp` を入れるか、末尾に 周期h を付けてください。")
-            return
+        info = state["bosses"].setdefault(name, {})
+        info["last_kill"] = fmt_ymdhm(kill)
+        info["skip_count"] = 0
+        info["rem1"] = False
+        set_next_spawn(name, kill, rh)
+        save()
 
-        nat = datetime.fromisoformat(st["bosses"][name]["next_at"])
-        mark = chance_mark(name)
-        await message.reply(f"✅ {name} を登録 → 次 {nat.strftime('%m/%d %H:%M:%S')} {mark}")
-        return
+        ns = parse_ymdhm(info["next_spawn"])
+        if ns:
+            await message.channel.send(
+                f"{name}\n次回出現{ns.strftime('%m月%d日%H時%M分%S秒')}※確定出現"
+            )
 
-    await bot.process_commands(message)
+async def send_list(channel: discord.abc.Messageable, hours: int | None):
+    """
+    一覧を '時刻 : ボス名 [n周]/※確定 (skip:x)' で整形表示。
+    時（HH）が変わるたびに空行3つで段落化。hours=None は次湧きのみ。
+    """
+    now_dt = now()
+    rows: list[tuple[datetime, str, int, int | None, int]] = []
 
-# ---- 通知（1分前をまとめて）----
-@tasks.loop(seconds=10)
-async def notifier():
-    state = load_state()
-    bump_skip_if_passed(state)
+    if hours is not None:
+        end = now_dt + timedelta(hours=hours)
 
-    ch_id = state.get("channel_id")
-    if not ch_id:
-        return
-    channel = bot.get_channel(ch_id)
-    if not isinstance(channel, discord.TextChannel):
-        return
-
-    nowt = now()
-    # 直近 1分以内に「1分前」になるボスを拾う
-    due = []
-    for name, b in state["bosses"].items():
-        na = b.get("next_at")
-        if not na:
+    for name, info in state["bosses"].items():
+        ns = parse_ymdhm(info.get("next_spawn", ""))
+        if not ns:
             continue
-        nat = datetime.fromisoformat(na)
-        # 1分前の時刻
-        pre_at = nat - timedelta(seconds=PRE_NOTIFY_SEC)
-        if 0 <= (nowt - pre_at).total_seconds() < 10:  # ループ10秒で検出
-            due.append((name, nat))
+        rh   = get_rh(name)
+        rate = get_rate(name)
+        skip = int(info.get("skip_count") or 0)
 
-    if not due:
-        return
-
-    # ±1分でグルーピング（同時沸き）
-    due.sort(key=lambda x: x[1])
-    groups = []
-    current = [due[0]]
-    for item in due[1:]:
-        if abs((item[1] - current[-1][1]).total_seconds()) <= GROUP_WINDOW_SEC:
-            current.append(item)
+        if hours is None:
+            rows.append((ns, name, 0, rate, skip))
         else:
-            groups.append(current)
-            current = [item]
-    groups.append(current)
+            t = ns
+            rounds = 0
+            while t <= end:
+                if t > now_dt:
+                    rows.append((t, name, rounds, rate, skip))
+                rounds += 1
+                t = ns + timedelta(hours=rh * rounds)
 
-    # まとめて1通ずつ送る
-    for group in groups:
-        lines = ["⏰ **1分前通知**"]
-        for name, nat in group:
-            mark = chance_mark(name)
-            lines.append(f"・{name} {mark} → {nat.strftime('%m/%d %H:%M:%S')}")
-        await safe_send(channel, "\n".join(lines))
+    rows.sort(key=lambda x: x[0])
 
-# ---- エントリ ----
+    if not rows:
+        return await channel.send(f"（該当なし / {hours or 'next'}）")
+
+    header = f"----- In {hours}hours Boss Time-----" if hours else "----- Next Boss Time -----"
+    lines = [header]
+
+    NAME_COL = 18
+    prev_key = None  # 段落化（年月日＋時）
+    for (t, n, r, rate, skip) in rows:
+        hour_key = t.strftime("%Y-%m-%d %H")
+        if prev_key is not None and hour_key != prev_key:
+            lines.extend(["", "", ""])  # 空行3つ
+        prev_key = hour_key
+
+        time_str = t.strftime("%H:%M:%S")
+        name_str = pad_to(n, NAME_COL)
+        tail = "※確定" if (rate == 100) else (f"[{r}周]" if r > 0 else "")
+        lines.append(f"{time_str} : {name_str}{tail} (skip:{skip})")
+
+    await channel.send("```\n" + "\n".join(lines) + "\n```")
+
+# ===== 通知ループ（1分前まとめ、スキップ通知なし）=====
+@tasks.loop(seconds=30)
+async def ticker():
+    """
+    30秒ごとにチェック。
+    - 出現1分前通知（±30秒補正、未送信のみ）
+    - 同時刻±1分に湧くボスを1通にまとめて通知
+    - 出現時は通知せず、次湧き更新＋skip+1、rem1解除
+    """
+    now_dt = now()
+    changed = False
+    pre_lines: list[tuple[datetime, str, int | None]] = []  # (spawn_time, name, rate)
+
+    for name, info in state["bosses"].items():
+        ns = parse_ymdhm(info.get("next_spawn", ""))
+        if not ns:
+            continue
+
+        rh   = get_rh(name)
+        rate = get_rate(name)
+        skip = int(info.get("skip_count") or 0)
+
+        # 1分前（±30秒）
+        pre_at = ns - timedelta(minutes=1)
+        if abs((pre_at - now_dt).total_seconds()) <= 30:
+            if not info.get("rem1", False):
+                pre_lines.append((ns, name, rate))  # 全ボス通知対象
+                info["rem1"] = True
+                changed = True
+
+        # 出現時（±30秒）：通知なしで次周へ
+        if abs((ns - now_dt).total_seconds()) <= 30:
+            ns_next = ns + timedelta(hours=rh)
+            info["next_spawn"] = fmt_ymdhm(ns_next)
+            info["rem1"] = False
+            info["skip_count"] = skip + 1
+            changed = True
+
+    # ±1分以内をまとめて1通ずつ送信
+    if pre_lines:
+        pre_lines.sort(key=lambda x: x[0])
+        groups = []
+        cur = []
+        for item in pre_lines:
+            if not cur:
+                cur.append(item); continue
+            anchor = cur[0][0]
+            if abs((item[0] - anchor).total_seconds()) <= 60:
+                cur.append(item)
+            else:
+                groups.append(cur)
+                cur = [item]
+        if cur:
+            groups.append(cur)
+
+        NAME_COL = 18
+        for group in groups:
+            group.sort(key=lambda x: x[0])
+            lines = ["----- 1min Before Spawn -----"]
+            for (t, n, rate) in group:
+                time_str = t.strftime("%H:%M:%S")
+                name_str = pad_to(n, NAME_COL)
+                tail = "※確定" if (rate == 100) else ""
+                lines.append(f"{time_str} : {name_str}{tail}")
+            await notify("```\n" + "\n".join(lines) + "\n```")
+
+    if changed:
+        save()
+
+# ===== Flask (Health) =====
+app = Flask(__name__)
+
+@app.route("/")
+def root():
+    return "OK"
+
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return Response(status=204)
+
+def run_http():
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+# ===== エントリポイント =====
 if __name__ == "__main__":
-    ensure_data_dir()
-    # Flask を別スレッドで
-    import threading
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
-
+    TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
     if not TOKEN:
-        raise RuntimeError("環境変数 DISCORD_TOKEN を設定してください")
-    bot.run(TOKEN)
+        print("❌ 環境変数 DISCORD_TOKEN が未設定です。RenderのEnvironmentに追加してください。")
+    else:
+        threading.Thread(target=run_http, daemon=True).start()
+        bot.run(TOKEN)
+
 
