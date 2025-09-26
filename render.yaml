@@ -3,7 +3,7 @@ services:
     name: l2m-bossbot
     env: python
     plan: free
-    pythonVersion: 3.12   # ← これを追加（3.11でも可）
+    pythonVersion: 3.12    # ← 追加（3.11でもOK）
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
     autoDeploy: true
