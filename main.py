@@ -85,28 +85,28 @@ def now_utc() -> datetime:
 class BossBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True   # ←これを追加
+        intents.message_content = True  # メッセージ本文を読むために必須（DevPortal側もONに）
         super().__init__(command_prefix="!", intents=intents)
+
         self.store = Store(STORE_FILE)
         self.data: Dict[str, Dict[str, dict]] = self.store.load()   # guild -> name -> dict
         self.presets: Dict[str, Tuple[int, int]] = {}               # name -> (respawn_min, rate)
         self.alias_map: Dict[str, Dict[str, str]] = {}              # guild -> norm -> canonical
         self._load_presets()
         self._seed_alias = self._build_seed_alias()
-        # NOTE: self.tick.start() は setup_hook で開始する（イベントループ起動後）
+        # NOTE: tick.start() とコマンド登録は setup_hook() で実施
 
     async def setup_hook(self):
-    # ループはここで開始（←既存）
-    self.tick.start()
-
-    # ✅ テキストコマンドを明示登録
-    for attr in (
-        "restart_cmd", "alias", "aliasshow",
-        "bt", "bt3", "bt6", "bt12", "bt24",
-        "reset", "rh", "rhshow",
-    ):
-        self.add_command(getattr(self, attr))
-
+        """Start background tasks and register text commands after loop is ready."""
+        # 背景タスク開始（イベントループ起動後なので安全）
+        self.tick.start()
+        # コマンドを明示登録
+        for attr in (
+            "restart_cmd", "alias", "aliasshow",
+            "bt", "bt3", "bt6", "bt12", "bt24",
+            "reset", "rh", "rhshow",
+        ):
+            self.add_command(getattr(self, attr))
 
     # ---- helpers: storage / ids ----
     def _gkey(self, gid: int) -> str:
@@ -238,52 +238,51 @@ class BossBot(commands.Bot):
     async def before_tick(self):
         await self.wait_until_ready()
 
-# ---- events ----
-async def on_message(self, message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    content = message.content.strip()
-
-    # ✅ ここを追加：先頭が '!' のときは「コマンド優先」
-    if content.startswith('!'):
-        await self.process_commands(message)
-        return
-
-    # （以下は討伐入力の高速処理）
-    parsed = self._parse_input(content)
-    if parsed:
-        raw, when_jst, respawn_min_override = parsed
-        canonical = self._resolve_alias(message.guild.id, raw)
-        if not canonical:
-            await message.reply(
-                f"ボス名を特定できません：`{raw}`\n`!aliasshow` で候補確認、または `!alias {raw} 正式名` で登録してください。",
-                mention_author=False
-            )
+    # ---- events ----
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
             return
-        gkey = self._gkey(message.guild.id)
-        g = self.data.get(gkey, {})
-        st = BossState(name=canonical, respawn_min=60)
-        if canonical in self.presets:
-            st.respawn_min, st.rate = self.presets[canonical]
-        if canonical in g:
-            st = BossState(**g[canonical])
-        if respawn_min_override:
-            st.respawn_min = respawn_min_override
-        st.channel_id = st.channel_id or message.channel.id
-        center = when_jst.astimezone(timezone.utc) + timedelta(
-            minutes=st.respawn_min + st.initial_delay_min
-        )
-        st.next_spawn_utc = int(center.timestamp())
-        st.skip = 0
-        self._set(message.guild.id, st)
-        await message.add_reaction("✅")
-        return
 
-    # 念のため：ここにも残しておいてOK（上の return で二重実行は回避される）
-    await self.process_commands(message)
+        content = message.content.strip()
 
-    
+        # 先頭が '!' はコマンド優先で処理
+        if content.startswith('!'):
+            await self.process_commands(message)
+            return
+
+        # 討伐入力の高速処理
+        parsed = self._parse_input(content)
+        if parsed:
+            raw, when_jst, respawn_min_override = parsed
+            canonical = self._resolve_alias(message.guild.id, raw)
+            if not canonical:
+                await message.reply(
+                    f"ボス名を特定できません：`{raw}`\n`!aliasshow` で候補確認、または `!alias {raw} 正式名` で登録してください。",
+                    mention_author=False
+                )
+                return
+            gkey = self._gkey(message.guild.id)
+            g = self.data.get(gkey, {})
+            st = BossState(name=canonical, respawn_min=60)
+            if canonical in self.presets:
+                st.respawn_min, st.rate = self.presets[canonical]
+            if canonical in g:
+                st = BossState(**g[canonical])
+            if respawn_min_override:
+                st.respawn_min = respawn_min_override
+            st.channel_id = st.channel_id or message.channel.id
+            center = when_jst.astimezone(timezone.utc) + timedelta(
+                minutes=st.respawn_min + st.initial_delay_min
+            )
+            st.next_spawn_utc = int(center.timestamp())
+            st.skip = 0
+            self._set(message.guild.id, st)
+            await message.add_reaction("✅")
+            return
+
+        # 念のため
+        await self.process_commands(message)
+
     # ---- commands ----
     @commands.command(name="restart")
     async def restart_cmd(self, ctx: commands.Context):
@@ -291,7 +290,7 @@ async def on_message(self, message: discord.Message):
         gc.collect()
         self.store.save(self.data)
         await self.close()
-        os._exit(1)  # Render が再起動
+        os._exit(1)  # Render がプロセス再起動
 
     @commands.command(name="alias")
     async def alias(self, ctx: commands.Context, short: str, canonical: str):
