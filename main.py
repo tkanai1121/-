@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import tasks
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from uvicorn import Config, Server
 
 # ====== CONST ======
@@ -18,6 +18,7 @@ CHECK_SEC = 10
 MERGE_WINDOW_SEC = 60  # ±60秒で通知集約
 
 # ====== Alias Normalize ======
+# カタカナ→ひらがな（大小含む）をざっくり正規化
 KANAS = str.maketrans({
     'ア':'あ','イ':'い','ウ':'う','エ':'え','オ':'お',
     'カ':'か','キ':'き','ク':'く','ケ':'け','コ':'こ',
@@ -28,8 +29,12 @@ KANAS = str.maketrans({
     'マ':'ま','ミ':'み','ム':'む','メ':'め','モ':'も',
     'ヤ':'や','ユ':'ゆ','ヨ':'よ',
     'ラ':'ら','リ':'り','ル':'る','レ':'れ','ロ':'ろ',
-    'ワ':'わ','ヲ':'を','ン':'ん'
+    'ワ':'わ','ヲ':'を','ン':'ん',
+    'ァ':'ぁ','ィ':'ぃ','ゥ':'ぅ','ェ':'ぇ','ォ':'ぉ',
+    'ッ':'っ','ャ':'ゃ','ュ':'ゅ','ョ':'ょ','ヮ':'ゎ',
+    'ヴ':'ゔ'
 })
+# 英字略称など
 ROMA = {
     "qa":"クイーンアント", "queen":"クイーンアント",
     "orfen":"オルフェン",
@@ -54,9 +59,9 @@ class BossState:
     skip: int = 0
     excluded_reset: bool = False
     initial_delay_min: int = 0
-    # 通知重複防止フラグ（この湧き=next_spawn_utcに対して送信済みか）
-    notified_pre_for: Optional[int] = None     # 1分前を送った next_spawn_utc
-    notified_spawn_for: Optional[int] = None   # 出現を送った next_spawn_utc
+    # 通知重複防止（この湧き=next_spawn_utcに対して送信済みか）
+    notified_pre_for: Optional[int] = None
+    notified_spawn_for: Optional[int] = None
 
     def label_flags(self) -> str:
         parts = []
@@ -93,11 +98,10 @@ class BossBot(discord.Client):
 
         self.store = Store(STORE_FILE)
         self.data: Dict[str, Dict[str, dict]] = self.store.load()     # guild -> name -> dict / "__cfg__"
-        self.presets: Dict[str, Tuple[int, int]] = {}                 # name -> (respawn_min, rate)
-        self.alias_map: Dict[str, Dict[str, str]] = {}                # guild -> norm -> canonical
+        self.presets: Dict[str, Tuple[int, int, int]] = {}            # name -> (respawn_min, rate, initial_delay_min)
+        self.alias_map: Dict[str, Dict[str, str]] = {}                # guild -> norm -> canonical（任意登録）
         self._load_presets()
         self._seed_alias = self._build_seed_alias()
-        # tick は setup_hook で開始する
 
     async def setup_hook(self):
         """イベントループ起動後に呼ばれる。ここでタスク開始。"""
@@ -131,7 +135,7 @@ class BossBot(discord.Client):
         g = self.data.setdefault(gkey, {})
         cfg = g.get("__cfg__")
         if not cfg:
-            cfg = {"channels": []}  # 明示登録チャンネルのみ許可
+            cfg = {"channels": []}  # 明示登録チャンネルのみ受け付け
             g["__cfg__"] = cfg
             self.store.save(self.data)
         return cfg
@@ -153,19 +157,31 @@ class BossBot(discord.Client):
         try:
             with open(PRESET_FILE, "r", encoding="utf-8") as f:
                 arr = json.load(f)
-            self.presets = {x["name"]: (int(round(float(x["respawn_h"]) * 60)), int(x["rate"])) for x in arr}
+            tmp = {}
+            for x in arr:
+                resp_min = int(round(float(x["respawn_h"]) * 60))
+                rate = int(x.get("rate", 100))
+                init = int(x.get("initial_delay_min", 0))
+                tmp[x["name"]] = (resp_min, rate, init)
+            self.presets = tmp
         except Exception as e:
             print("preset load error:", e)
             self.presets = {}
+
     def _build_seed_alias(self) -> Dict[str, str]:
         seed: Dict[str, str] = {}
         for name in self.presets.keys():
             n = normalize_name(name)
             for L in (2,3,4):
                 seed.setdefault(n[:L], name)
-        for k,v in ROMA.items():
+        # 旧表記の吸収（正式名：チェルトゥバ）
+        seed[normalize_name("チェトゥバ")] = "チェルトゥバ"
+        seed[normalize_name("チェトゥルゥバ")] = "チェルトゥバ"
+        # 英字略称など
+        for k, v in ROMA.items():
             seed[normalize_name(k)] = v
         return seed
+
     def _resolve_alias(self, guild_id: int, raw: str) -> Optional[str]:
         g_alias = self.alias_map.get(self._gkey(guild_id), {})
         norm = normalize_name(raw)
@@ -289,7 +305,7 @@ class BossBot(discord.Client):
             if current_hour is None:
                 current_hour = j.hour
             if j.hour != current_hour:
-                lines += ["", "", ""]
+                lines.append("")   # ← 改行は1つだけ
                 current_hour = j.hour
             lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.label_flags()}")
         await channel.send("\n".join(lines))
@@ -300,7 +316,7 @@ class BossBot(discord.Client):
         for st in arr:
             if kw and kw not in st.name:
                 continue
-            lines.append(f"• {st.name} : {st.respawn_min/60:.2f}h / rate {st.rate}%")
+            lines.append(f"• {st.name} : {st.respawn_min/60:.2f}h / rate {st.rate}% / delay {st.initial_delay_min}m")
         await channel.send("\n".join(lines) or "登録なし")
 
     # ---- event: messages ----
@@ -309,8 +325,26 @@ class BossBot(discord.Client):
             return
 
         content = message.content.strip()
+        lower = content.lower()
 
-        # 1) '!' コマンド（どのチャンネルでも受け付け）
+        # 0) bt系は '!' 省略対応（どのチャンネルでも可）
+        if lower in ("bt", "bt3", "bt6", "bt12", "bt24"):
+            try:
+                if lower == "bt":
+                    await self._send_bt_message(message.channel, message.guild.id, None)
+                elif lower == "bt3":
+                    await self._send_bt_message(message.channel, message.guild.id, 3)
+                elif lower == "bt6":
+                    await self._send_bt_message(message.channel, message.guild.id, 6)
+                elif lower == "bt12":
+                    await self._send_bt_message(message.channel, message.guild.id, 12)
+                elif lower == "bt24":
+                    await self._send_bt_message(message.channel, message.guild.id, 24)
+            except Exception as e:
+                await message.channel.send(f"エラー: {e}")
+            return
+
+        # 1) '!' から始まる通常コマンド
         if content.startswith('!'):
             parts = content[1:].split()
             if not parts:
@@ -340,31 +374,65 @@ class BossBot(discord.Client):
                     self._set(message.guild.id, st)
                     await message.channel.send(f"{canonical} の周期を {h}h に設定しました。")
                 elif cmd == "reset" and len(args) >= 1:
+                    # 仕様：100%&delay0 → 未スケジュール（手動入力）
+                    #       100%&delay>0 → base + delay
+                    #       50/33%&delay0 → base + 周期
+                    #       50/33%&delay>0 → base + delay
                     p = args[0].zfill(4)
                     h, m = int(p[:2]), int(p[2:])
                     base = datetime.now(JST).replace(hour=h, minute=m, second=0, microsecond=0)
+                    n_none = n_set = 0
                     for st in self._all(message.guild.id):
                         if st.excluded_reset:
                             continue
-                        center = base + timedelta(minutes=st.respawn_min + st.initial_delay_min)
+                        rate = st.rate or 100
+                        delay = int(st.initial_delay_min or 0)
+                        if rate == 100 and delay == 0:
+                            st.next_spawn_utc = None
+                            st.skip = 0
+                            st.notified_pre_for = None
+                            st.notified_spawn_for = None
+                            self._set(message.guild.id, st)
+                            n_none += 1
+                            continue
+                        if rate == 100 and delay > 0:
+                            center = base + timedelta(minutes=delay)
+                        else:
+                            center = base + timedelta(minutes=(delay if delay > 0 else st.respawn_min))
                         st.next_spawn_utc = int(center.astimezone(timezone.utc).timestamp())
                         st.skip = 0
                         st.notified_pre_for = None
                         st.notified_spawn_for = None
                         self._set(message.guild.id, st)
-                    await message.channel.send(f"全体を {base.strftime('%H:%M')} リセットしました。")
-                elif cmd == "alias" and len(args) >= 2:
-                    short = args[0]; canonical = " ".join(args[1:])
-                    gkey = self._gkey(message.guild.id)
-                    self.alias_map.setdefault(gkey, {})[normalize_name(short)] = canonical
-                    await message.channel.send(f"`{short}` を `{canonical}` の別名として登録しました。")
-                elif cmd == "aliasshow":
-                    g_alias = self.alias_map.get(self._gkey(message.guild.id), {})
-                    if not g_alias:
-                        await message.channel.send("（別名は未登録です）")
+                        n_set += 1
+                    await message.channel.send(
+                        f"リセット: {base.strftime('%H:%M')} / スケジュール設定 {n_set}件・手動入力待ち {n_none}件"
+                    )
+                elif cmd == "delay" and len(args) >= 2:
+                    # !delay ボス名 10m / 5 / 0
+                    name, amount = args[0], args[1].lower()
+                    canonical = self._resolve_alias(message.guild.id, name) or name
+                    st = self._get(message.guild.id, canonical) or BossState(name=canonical, respawn_min=60)
+                    if canonical in self.presets:
+                        st.respawn_min, st.rate, _init = self.presets[canonical]
+                    if amount.endswith("m"):
+                        minutes = int(float(amount[:-1]))
+                    elif amount.endswith("h"):
+                        minutes = int(round(float(amount[:-1]) * 60))
                     else:
-                        lines = [f"• {k} → {v}" for k, v in sorted(g_alias.items())]
-                        await message.channel.send("\n".join(lines))
+                        minutes = int(float(amount))
+                    st.initial_delay_min = max(0, minutes)
+                    self._set(message.guild.id, st)
+                    await message.channel.send(f"{canonical} の初回遅延を {st.initial_delay_min} 分に設定しました。")
+                elif cmd == "delayshow":
+                    kw = " ".join(args) if args else None
+                    arr = sorted(self._all(message.guild.id), key=lambda s: s.name)
+                    lines = []
+                    for st in arr:
+                        if kw and kw not in st.name:
+                            continue
+                        lines.append(f"• {st.name} : 初回遅延 {st.initial_delay_min}m / 周期 {st.respawn_min/60:.2f}h / rate {st.rate}%")
+                    await message.channel.send("\n".join(lines) or "登録なし")
                 # 受け付けチャンネル制御
                 elif cmd in ("hereon", "enablehere", "watchon"):
                     self._enable_channel(message.guild.id, message.channel.id)
@@ -378,6 +446,18 @@ class BossBot(discord.Client):
                         await message.channel.send("（受け付けチャンネル未設定）")
                     else:
                         await message.channel.send("受け付け中: " + " ".join(f"<#{cid}>" for cid in cids))
+                elif cmd == "alias" and len(args) >= 2:
+                    short = args[0]; canonical = " ".join(args[1:])
+                    gkey = self._gkey(message.guild.id)
+                    self.alias_map.setdefault(gkey, {})[normalize_name(short)] = canonical
+                    await message.channel.send(f"`{short}` を `{canonical}` の別名として登録しました。")
+                elif cmd == "aliasshow":
+                    g_alias = self.alias_map.get(self._gkey(message.guild.id), {})
+                    if not g_alias:
+                        await message.channel.send("（別名は未登録です）")
+                    else:
+                        lines = [f"• {k} → {v}" for k, v in sorted(g_alias.items())]
+                        await message.channel.send("\n".join(lines))
                 elif cmd == "restart":
                     await message.channel.send("♻️ Botを再起動します...")
                     gc.collect()
@@ -397,11 +477,13 @@ class BossBot(discord.Client):
             raw, when_jst, respawn_min_override = parsed
             canonical = self._resolve_alias(message.guild.id, raw)
             if not canonical:
-                # ボス名不明時は黙って無視（誤爆対策）
-                return
+                return  # ボス名不明は黙って無視
             st = self._get(message.guild.id, canonical) or BossState(name=canonical, respawn_min=60)
             if canonical in self.presets:
-                st.respawn_min, st.rate = self.presets[canonical]
+                pr = self.presets[canonical]
+                st.respawn_min, st.rate = pr[0], pr[1]
+                if st.initial_delay_min == 0:
+                    st.initial_delay_min = int(pr[2] or 0)
             if respawn_min_override:
                 st.respawn_min = respawn_min_override
             st.channel_id = st.channel_id or message.channel.id
@@ -420,14 +502,21 @@ app = FastAPI()
 bot: Optional[BossBot] = None
 
 @app.get("/health")
-async def health():
-    gc.collect()
+async def health(silent: int = 0):
+    # 超軽量ヘルス：本文が大きくならないように
     try:
+        gc.collect()
         if bot is not None:
             bot.data = bot.store.load()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    return {"ok": True}
+    except Exception:
+        pass
+    if silent:
+        return Response(status_code=204)  # 本文ゼロ
+    return Response(content="ok", media_type="text/plain")  # ごく短い本文
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=204)  # HEADは常に本文ゼロ
 
 def run():
     token = os.environ.get("DISCORD_TOKEN")
@@ -437,7 +526,14 @@ def run():
     bot = BossBot()
 
     async def main_async():
-        config = Config(app=app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), loop="asyncio")
+        config = Config(
+            app=app,
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", 10000)),
+            loop="asyncio",
+            access_log=False,
+            log_level="warning",
+        )
         server = Server(config)
         bot_task = asyncio.create_task(bot.start(token))
         api_task = asyncio.create_task(server.serve())
@@ -447,4 +543,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
