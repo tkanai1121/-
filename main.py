@@ -225,58 +225,61 @@ class BossBot(discord.Client):
     # ---- background ticker ----
     @tasks.loop(seconds=CHECK_SEC)
     async def tick(self):
-        await self.wait_until_ready()
-        now = now_utc()
-        for gkey, bosses in list(self.data.items()):
-            guild = self.get_guild(int(gkey))
-            if not guild:
-                continue
-            pre_items: Dict[int, List[str]] = {}
-            now_items: Dict[int, List[str]] = {}
-
-            for key, d in bosses.items():
-                if key == "__cfg__":
+        try:
+            await self.wait_until_ready()
+            now = now_utc()
+            for gkey, bosses in list(self.data.items()):
+                guild = self.get_guild(int(gkey))
+                if not guild:
                     continue
-                st = BossState(**d)
-                if not st.channel_id or not st.next_spawn_utc:
-                    continue
+                pre_items: Dict[int, List[str]] = {}
+                now_items: Dict[int, List[str]] = {}
 
-                center = datetime.fromtimestamp(st.next_spawn_utc, tz=timezone.utc)
-                pre_time = center - timedelta(minutes=1)
+                for key, d in bosses.items():
+                    if key == "__cfg__":
+                        continue
+                    st = BossState(**d)
+                    if not st.channel_id or not st.next_spawn_utc:
+                        continue
 
-                # 1分前（この湧きで未送信なら送る）
-                if (st.notified_pre_for != st.next_spawn_utc and
-                    abs((now - pre_time).total_seconds()) <= MERGE_WINDOW_SEC):
-                    pre_items.setdefault(st.channel_id, []).append(
-                        f"{center.astimezone(JST).strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".strip()
-                    )
-                    st.notified_pre_for = st.next_spawn_utc
-                    self._set(int(gkey), st)
+                    center = datetime.fromtimestamp(st.next_spawn_utc, tz=timezone.utc)
+                    pre_time = center - timedelta(minutes=1)
 
-                # 出現（この湧きで未送信なら送る）
-                if (st.notified_spawn_for != st.next_spawn_utc and
-                    abs((now - center).total_seconds()) <= MERGE_WINDOW_SEC):
-                    now_items.setdefault(st.channel_id, []).append(
-                        f"{st.name} 出現！ [{center.astimezone(JST).strftime('%H:%M:%S')}] (skip:{st.skip}) {st.label_flags()}".strip()
-                    )
-                    st.notified_spawn_for = st.next_spawn_utc
-                    self._set(int(gkey), st)
+                    # 1分前（この湧きで未送信なら送る）
+                    if (st.notified_pre_for != st.next_spawn_utc and
+                        abs((now - pre_time).total_seconds()) <= MERGE_WINDOW_SEC):
+                        pre_items.setdefault(st.channel_id, []).append(
+                            f"{center.astimezone(JST).strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".strip()
+                        )
+                        st.notified_pre_for = st.next_spawn_utc
+                        self._set(int(gkey), st)
 
-                # 出現から1分経過 → 次周へスライド（フラグもリセット）
-                if (now - center).total_seconds() >= 60:
-                    st.next_spawn_utc += st.respawn_min * 60
-                    st.skip += 1
-                    st.notified_pre_for = None
-                    st.notified_spawn_for = None
-                    self._set(int(gkey), st)
+                    # 出現（この湧きで未送信なら送る）
+                    if (st.notified_spawn_for != st.next_spawn_utc and
+                        abs((now - center).total_seconds()) <= MERGE_WINDOW_SEC):
+                        now_items.setdefault(st.channel_id, []).append(
+                            f"{st.name} 出現！ [{center.astimezone(JST).strftime('%H:%M:%S')}] (skip:{st.skip}) {st.label_flags()}".strip()
+                        )
+                        st.notified_spawn_for = st.next_spawn_utc
+                        self._set(int(gkey), st)
 
-            # 送信（チャンネルごとに1メッセージ）
-            for cid, arr in pre_items.items():
-                ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
-                await ch.send("⏰ 1分前 " + "\n".join(sorted(arr)))
-            for cid, arr in now_items.items():
-                ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
-                await ch.send("🔥 " + "\n".join(sorted(arr)))
+                    # 出現から1分経過 → 次周へスライド（フラグもリセット）
+                    if (now - center).total_seconds() >= 60:
+                        st.next_spawn_utc += st.respawn_min * 60
+                        st.skip += 1
+                        st.notified_pre_for = None
+                        st.notified_spawn_for = None
+                        self._set(int(gkey), st)
+
+                # 送信（チャンネルごとに1メッセージ）
+                for cid, arr in pre_items.items():
+                    ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
+                    await ch.send("⏰ 1分前 " + "\n".join(sorted(arr)))
+                for cid, arr in now_items.items():
+                    ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
+                    await ch.send("🔥 " + "\n".join(sorted(arr)))
+        except Exception as e:
+            print("tick error:", repr(e))
 
     @tick.before_loop
     async def before_tick(self):
@@ -305,7 +308,7 @@ class BossBot(discord.Client):
             if current_hour is None:
                 current_hour = j.hour
             if j.hour != current_hour:
-                lines.append("")   # ← 改行は1つだけ
+                lines.append("")   # 改行は1つだけ
                 current_hour = j.hour
             lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.label_flags()}")
         await channel.send("\n".join(lines))
@@ -409,7 +412,7 @@ class BossBot(discord.Client):
                         f"リセット: {base.strftime('%H:%M')} / スケジュール設定 {n_set}件・手動入力待ち {n_none}件"
                     )
                 elif cmd == "delay" and len(args) >= 2:
-                    # !delay ボス名 10m / 5 / 0
+                    # !delay ボス名 10m / 1h / 5
                     name, amount = args[0], args[1].lower()
                     canonical = self._resolve_alias(message.guild.id, name) or name
                     st = self._get(message.guild.id, canonical) or BossState(name=canonical, respawn_min=60)
@@ -503,41 +506,47 @@ bot: Optional[BossBot] = None
 
 @app.get("/health")
 async def health(silent: int = 0):
-    # 超軽量ヘルス：本文が大きくならないように
-    try:
-        gc.collect()
-        if bot is not None:
-            bot.data = bot.store.load()
-    except Exception:
-        pass
+    # 余計な処理は一切せず即レス（レート制限や切断で落ちない）
     if silent:
         return Response(status_code=204)  # 本文ゼロ
-    return Response(content="ok", media_type="text/plain")  # ごく短い本文
+    return Response(content=b"ok", status_code=200, media_type="text/plain")
 
 @app.head("/health")
 async def health_head():
-    return Response(status_code=204)  # HEADは常に本文ゼロ
+    return Response(status_code=204)
 
 def run():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set")
+
     global bot
     bot = BossBot()
 
+    async def serve_api_forever():
+        # uvicorn が CancelledError 等で落ちても自動再起動
+        while True:
+            try:
+                config = Config(
+                    app=app,
+                    host="0.0.0.0",
+                    port=int(os.environ.get("PORT", 10000)),
+                    loop="asyncio",
+                    access_log=False,
+                    log_level="warning",
+                    lifespan="off",        # ← 重要：lifespan無効
+                    timeout_keep_alive=5   # 切断を早めて固まり回避
+                )
+                server = Server(config)
+                await server.serve()
+            except Exception as e:
+                print("uvicorn crashed:", repr(e))
+            await asyncio.sleep(1)  # 連続再起動のスパイク回避
+
     async def main_async():
-        config = Config(
-            app=app,
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT", 10000)),
-            loop="asyncio",
-            access_log=False,
-            log_level="warning",
-        )
-        server = Server(config)
+        api_task = asyncio.create_task(serve_api_forever())
         bot_task = asyncio.create_task(bot.start(token))
-        api_task = asyncio.create_task(server.serve())
-        await asyncio.wait([bot_task, api_task], return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.gather(api_task, bot_task)
 
     asyncio.run(main_async())
 
