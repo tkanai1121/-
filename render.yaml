@@ -3,7 +3,6 @@ services:
     name: l2m-bossbot
     env: python
     plan: free
-    pythonVersion: 3.12    # ← 追加（3.11でもOK）
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
     autoDeploy: true
@@ -11,3 +10,7 @@ services:
     envVars:
       - key: DISCORD_TOKEN
         sync: false
+      - key: BACKOFF_429_MIN
+        value: "900"
+      - key: BACKOFF_JITTER_SEC
+        value: "30"
