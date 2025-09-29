@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, json, re, gc, unicodedata, asyncio, random
+import os, json, re, gc, unicodedata, asyncio, random, logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -8,6 +8,9 @@ import discord
 from discord.ext import tasks
 from fastapi import FastAPI, Response
 from uvicorn import Config, Server
+
+# ====== logging ======
+logging.basicConfig(level=logging.INFO)
 
 # ====== CONST ======
 JST = timezone(timedelta(hours=9))
@@ -18,7 +21,6 @@ CHECK_SEC = 10
 MERGE_WINDOW_SEC = 60  # ±60秒で通知集約
 
 # ====== Alias Normalize ======
-# カタカナ→ひらがな（大小含む）をざっくり正規化
 KANAS = str.maketrans({
     'ア':'あ','イ':'い','ウ':'う','エ':'え','オ':'お',
     'カ':'か','キ':'き','ク':'く','ケ':'け','コ':'こ',
@@ -34,7 +36,6 @@ KANAS = str.maketrans({
     'ッ':'っ','ャ':'ゃ','ュ':'ゅ','ョ':'ょ','ヮ':'ゎ',
     'ヴ':'ゔ'
 })
-# 英字略称など
 ROMA = {
     "qa":"クイーンアント", "queen":"クイーンアント",
     "orfen":"オルフェン",
@@ -59,7 +60,6 @@ class BossState:
     skip: int = 0
     excluded_reset: bool = False
     initial_delay_min: int = 0
-    # 通知重複防止（この湧き=next_spawn_utcに対して送信済みか）
     notified_pre_for: Optional[int] = None
     notified_spawn_for: Optional[int] = None
 
@@ -93,19 +93,34 @@ def now_utc() -> datetime:
 class BossBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # DevPortal側もONに
+        intents.message_content = True  # DevPortal側もON推奨
         super().__init__(intents=intents)
 
         self.store = Store(STORE_FILE)
         self.data: Dict[str, Dict[str, dict]] = self.store.load()     # guild -> name -> dict / "__cfg__"
         self.presets: Dict[str, Tuple[int, int, int]] = {}            # name -> (respawn_min, rate, initial_delay_min)
-        self.alias_map: Dict[str, Dict[str, str]] = {}                # guild -> norm -> canonical（任意登録）
+        self.alias_map: Dict[str, Dict[str, str]] = {}                # guild -> norm -> canonical
         self._load_presets()
-        self._seed_alias = self._build_seed_alias()
+        self._seed_alias: Dict[str, str] = self._build_seed_alias()
 
     async def setup_hook(self):
-        """イベントループ起動後に呼ばれる。ここでタスク開始。"""
         self.tick.start()
+
+    async def on_ready(self):
+        print(f"LOGGED IN as {self.user} (id={self.user.id})")
+        try:
+            await self.change_presence(
+                status=discord.Status.online,
+                activity=discord.Activity(type=discord.ActivityType.watching, name="bt / hereon")
+            )
+        except Exception as e:
+            print("presence set error:", repr(e))
+
+    async def on_resumed(self):
+        print("WS resumed")
+
+    async def on_disconnect(self):
+        print("WS disconnected")
 
     # ---- helpers: storage / ids ----
     def _gkey(self, gid: int) -> str:
@@ -172,12 +187,12 @@ class BossBot(discord.Client):
         seed: Dict[str, str] = {}
         for name in self.presets.keys():
             n = normalize_name(name)
-            for L in (2,3,4):
+            for L in (2, 3, 4):
                 seed.setdefault(n[:L], name)
         # 旧表記の吸収（正式名：チェルトゥバ）
         seed[normalize_name("チェトゥバ")] = "チェルトゥバ"
         seed[normalize_name("チェトゥルゥバ")] = "チェルトゥバ"
-        # 英字略称など
+        # 英字略称
         for k, v in ROMA.items():
             seed[normalize_name(k)] = v
         return seed
@@ -191,7 +206,7 @@ class BossBot(discord.Client):
             if normalize_name(canonical) == norm:
                 return canonical
         if norm in self._seed_alias:
-            return self._seed_alias(norm)
+            return self._seed_alias.get(norm)
         cands = [n for n in self.presets.keys() if normalize_name(n).startswith(norm)]
         if len(cands) == 1:
             return cands[0]
@@ -308,7 +323,7 @@ class BossBot(discord.Client):
             if current_hour is None:
                 current_hour = j.hour
             if j.hour != current_hour:
-                lines.append("")   # 改行は1つだけ
+                lines.append("")   # 改行は1つ
                 current_hour = j.hour
             lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.label_flags()}")
         await channel.send("\n".join(lines))
@@ -506,7 +521,6 @@ bot: Optional[BossBot] = None
 
 @app.get("/health")
 async def health(silent: int = 0):
-    # 余計な処理は一切せず即レス
     if silent:
         return Response(status_code=204)  # 本文ゼロ
     return Response(content=b"ok", status_code=200, media_type="text/plain")
@@ -524,7 +538,6 @@ def run():
     bot = BossBot()
 
     async def serve_api_forever():
-        # uvicorn が落ちても自動で再起動
         while True:
             try:
                 config = Config(
@@ -544,11 +557,11 @@ def run():
             await asyncio.sleep(1)
 
     async def run_bot_forever():
-        # Discord 429 / Cloudflare 1015 を踏んだら長めに待機して再試行
-        backoff = 30  # 一般エラーの初期待機（秒）
+        base_backoff = 30
         while True:
             try:
-                await bot.start(token)  # 正常なら戻らない
+                print("[BOT] trying to login/connect to Discord Gateway...")
+                await bot.start(token)
                 await asyncio.sleep(5)
             except Exception as e:
                 is_429 = False
@@ -559,12 +572,13 @@ def run():
                     pass
                 text = str(e).lower()
                 if is_429 or "1015" in text or "rate limited" in text:
-                    wait = random.randint(900, 1500)  # 15〜25分
+                    low = int(os.getenv("BACKOFF_429_MIN", "900"))  # 既定15分
+                    wait = random.randint(low, low + 600)           # +10分幅
                     print(f"[BOT] 429/RateLimited を検出。{wait}s 待機して再試行します。")
-                    backoff = 30
+                    base_backoff = 30
                 else:
-                    wait = backoff
-                    backoff = min(backoff * 2, 300)  # 最大5分
+                    wait = base_backoff
+                    base_backoff = min(base_backoff * 2, 300)      # 最大5分
                     print(f"[BOT] 例外で再起動: {repr(e)} / {wait}s 後に再試行")
                 await asyncio.sleep(wait)
 
