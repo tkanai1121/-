@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, json, re, gc, unicodedata, asyncio
+import os, json, re, gc, unicodedata, asyncio, random
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -191,7 +191,7 @@ class BossBot(discord.Client):
             if normalize_name(canonical) == norm:
                 return canonical
         if norm in self._seed_alias:
-            return self._seed_alias[norm]
+            return self._seed_alias(norm)
         cands = [n for n in self.presets.keys() if normalize_name(n).startswith(norm)]
         if len(cands) == 1:
             return cands[0]
@@ -506,7 +506,7 @@ bot: Optional[BossBot] = None
 
 @app.get("/health")
 async def health(silent: int = 0):
-    # 余計な処理は一切せず即レス（レート制限や切断で落ちない）
+    # 余計な処理は一切せず即レス
     if silent:
         return Response(status_code=204)  # 本文ゼロ
     return Response(content=b"ok", status_code=200, media_type="text/plain")
@@ -524,7 +524,7 @@ def run():
     bot = BossBot()
 
     async def serve_api_forever():
-        # uvicorn が CancelledError 等で落ちても自動再起動
+        # uvicorn が落ちても自動で再起動
         while True:
             try:
                 config = Config(
@@ -534,18 +534,43 @@ def run():
                     loop="asyncio",
                     access_log=False,
                     log_level="warning",
-                    lifespan="off",        # ← 重要：lifespan無効
-                    timeout_keep_alive=5   # 切断を早めて固まり回避
+                    lifespan="off",        # 重要：lifespan無効
+                    timeout_keep_alive=5
                 )
                 server = Server(config)
                 await server.serve()
             except Exception as e:
                 print("uvicorn crashed:", repr(e))
-            await asyncio.sleep(1)  # 連続再起動のスパイク回避
+            await asyncio.sleep(1)
+
+    async def run_bot_forever():
+        # Discord 429 / Cloudflare 1015 を踏んだら長めに待機して再試行
+        backoff = 30  # 一般エラーの初期待機（秒）
+        while True:
+            try:
+                await bot.start(token)  # 正常なら戻らない
+                await asyncio.sleep(5)
+            except Exception as e:
+                is_429 = False
+                try:
+                    import discord as _d
+                    is_429 = isinstance(e, _d.HTTPException) and getattr(e, "status", None) == 429
+                except Exception:
+                    pass
+                text = str(e).lower()
+                if is_429 or "1015" in text or "rate limited" in text:
+                    wait = random.randint(900, 1500)  # 15〜25分
+                    print(f"[BOT] 429/RateLimited を検出。{wait}s 待機して再試行します。")
+                    backoff = 30
+                else:
+                    wait = backoff
+                    backoff = min(backoff * 2, 300)  # 最大5分
+                    print(f"[BOT] 例外で再起動: {repr(e)} / {wait}s 後に再試行")
+                await asyncio.sleep(wait)
 
     async def main_async():
         api_task = asyncio.create_task(serve_api_forever())
-        bot_task = asyncio.create_task(bot.start(token))
+        bot_task = asyncio.create_task(run_bot_forever())
         await asyncio.gather(api_task, bot_task)
 
     asyncio.run(main_async())
