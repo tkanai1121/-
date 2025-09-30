@@ -2,6 +2,7 @@
 import os
 import json
 import asyncio
+import random
 import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -9,8 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
-from fastapi import FastAPI
-from uvicorn import Config, Server
+from aiohttp import web
 
 # -------------------- 基本定数 -------------------- #
 JST = timezone(timedelta(hours=9))
@@ -104,11 +104,20 @@ class BossBot(commands.Bot):
         # 通知の重複抑止用（ギルドごとに送信済みキーと期限）
         self._sent_keys: Dict[str, Dict[str, int]] = {}
 
-    # ---- discord.py v2 の正しい起動箇所 ---- #
+        # tasks.loop を二重起動しないためのフラグ
+        self._tick_started: bool = False
+
     async def setup_hook(self):
+        # ここではプリセット読込のみ（ループは開始しない）
         self._load_presets()
-        # ここで tasks.loop を開始する（__init__ や on_ready ではなく）
-        self.tick.start()
+
+    # ループ開始は on_ready で一度だけ（←ここが今回の修正ポイント）
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self._tick_started:
+            self.tick.start()      # ← running event loop 上で開始
+            self._tick_started = True
+        print(f"[BOT] Logged in as {self.user} (ID: {self.user.id})")
 
     # ----------------- プリセット/別名 ----------------- #
     def _load_presets(self):
@@ -124,7 +133,6 @@ class BossBot(commands.Bot):
                 respawn_h = row.get("respawn_h", 0)
                 respawn_min = int(round(float(respawn_h) * 60))
                 first_delay_min = 0
-                # "初回出現遅延" を "H:MM" / floatH のどちらでも受ける
                 if "first_delay_h" in row:
                     fd = str(row["first_delay_h"])
                     if ":" in fd:
@@ -134,7 +142,7 @@ class BossBot(commands.Bot):
                         first_delay_min = int(round(float(fd) * 60))
                 m[name] = (respawn_min, rate, first_delay_min)
 
-                # シンプルな別名（ローマ字略など）: 必要ならここで増やす
+                # 別名（必要に応じ追加）
                 nkey = normalize_for_match(name)
                 alias[nkey] = name
                 if name == "クイーンアント":
@@ -185,21 +193,17 @@ class BossBot(commands.Bot):
 
     # ----------------- 入力パース ----------------- #
     def _resolve_boss_name(self, user_text: str) -> Optional[str]:
-        # 正式名一致
         if user_text in self.presets:
             return user_text
-        # 別名 / 部分一致
         key = normalize_for_match(user_text)
         if key in self.alias_map:
             return self.alias_map[key]
-        # 先頭一致・部分一致（normalize）
         for off in self.presets.keys():
             if normalize_for_match(off).startswith(key) or key in normalize_for_match(off):
                 return off
         return None
 
     def _parse_kill_input(self, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
-        # 例: 「スタン 1120」 / 「スタン 1120 4h」 / 「フェリス」
         parts = content.strip().split()
         if len(parts) == 0:
             return None
@@ -261,7 +265,6 @@ class BossBot(commands.Bot):
             if not guild:
                 continue
 
-            # チャンネルごとの集約
             pre_labels: Dict[int, List[str]] = {}
             now_labels: Dict[int, List[str]] = {}
 
@@ -436,11 +439,6 @@ class BossBot(commands.Bot):
         )
 
     async def _reset_all(self, guild_id: int, base_jst: datetime):
-        # 仕様：
-        # 100% & 初回遅延0 → 手動入力（next未設定）
-        # 100% & 初回遅延あり → (reset + 初回遅延)
-        # 50%/33% & 初回遅延0 → (reset + 通常周期)
-        # 50%/33% & 初回遅延あり → (reset + 初回遅延)
         for st in self._all_bosses(guild_id):
             preset = self.presets.get(st.name, (st.respawn_min, st.rate, st.first_delay_min))
             st.respawn_min, st.rate, st.first_delay_min = preset
@@ -455,14 +453,13 @@ class BossBot(commands.Bot):
                 center = base_jst.astimezone(timezone.utc) + timedelta(minutes=st.respawn_min)
                 st.next_spawn_utc = dt_to_ts(center)
                 st.skip = 0
-            else:  # 50/33 & 初回遅延あり
+            else:
                 center = base_jst.astimezone(timezone.utc) + timedelta(minutes=st.first_delay_min)
                 st.next_spawn_utc = dt_to_ts(center)
                 st.skip = 0
             self._set_boss(guild_id, st)
 
     async def _send_bt(self, channel: discord.TextChannel, guild_id: int, horizon_h: Optional[int]):
-        # 時刻順、時台切替で改行1つ
         items = []
         now = now_utc()
         for st in self._all_bosses(guild_id):
@@ -485,18 +482,59 @@ class BossBot(commands.Bot):
             if cur_h is None:
                 cur_h = j.hour
             if j.hour != cur_h:
-                lines.append("")  # 改行1つに変更（ユーザー要望）
+                lines.append("")  # 改行1つ
                 cur_h = j.hour
             lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.flags()}")
 
         await channel.send("\n".join(lines))
 
-# -------------------- Keepalive API -------------------- #
-app = FastAPI()
+# -------------------- Keepalive (aiohttp) -------------------- #
+_shutdown_event = asyncio.Event()
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+async def _ok_json(_):
+    return web.json_response({"ok": True})
+
+async def _ok_head(_):
+    return web.Response(status=200)
+
+async def start_health_server(port: int):
+    app = web.Application()
+    app.router.add_get("/", _ok_json)
+    app.router.add_head("/", _ok_head)
+    app.router.add_get("/health", _ok_json)
+    app.router.add_head("/health", _ok_head)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    print(f"[HEALTH] Listening on :{port} (/, /health)")
+
+    try:
+        await _shutdown_event.wait()
+    finally:
+        await runner.cleanup()
+        print("[HEALTH] Shutdown")
+
+# -------------------- BOT 起動（429にリトライ・バックオフ） -------------------- #
+async def run_bot(bot: BossBot, token: str):
+    while True:
+        try:
+            await bot.start(token)
+        except discord.errors.HTTPException as e:
+            if getattr(e, "status", None) == 429:
+                wait = BACKOFF_429_MIN * 60 + random.randint(0, BACKOFF_JITTER_SEC)
+                print(f"[BOT] 429/RateLimited detected. Sleep {wait}s then retry.")
+                await asyncio.sleep(wait)
+                continue
+            else:
+                raise
+        except Exception as e:
+            print(f"[BOT] crashed: {e}. retry in 10s")
+            await asyncio.sleep(10)
+            continue
+        else:
+            break
 
 # -------------------- 起動 -------------------- #
 def run():
@@ -507,36 +545,25 @@ def run():
     bot = BossBot()
 
     async def main_async():
-        # Discord と FastAPI を同一イベントループで並列起動
-        config = Config(app=app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), loop="asyncio")
-        server = Server(config)
+        port = int(os.environ.get("PORT", "10000"))
 
-        async def run_bot():
-            try:
-                await bot.start(token)
-            except discord.errors.HTTPException as e:
-                if e.status == 429:
-                    # Cloudflare RateLimited → バックオフ
-                    wait = BACKOFF_429_MIN * 60 + BACKOFF_JITTER_SEC
-                    chs = [cid for g in bot.data.values() for cid in g.get("channels", [])]
-                    for gid, g in bot.data.items():
-                        guild = bot.get_guild(int(gid))
-                        if guild:
-                            for cid in g.get("channels", []):
-                                ch = guild.get_channel(cid)
-                                if ch:
-                                    try:
-                                        await ch.send(f"[BOT] 429/RateLimited を検出。{wait}s 待機して再試行します。")
-                                    except Exception:
-                                        pass
-                    await asyncio.sleep(wait)
-                    await bot.start(token)
-                else:
-                    raise
+        # 1) 先にヘルスサーバを起動（Renderのhealth check対策）
+        health_task = asyncio.create_task(start_health_server(port))
+        await asyncio.sleep(0.2)  # bind完了の小休止
 
-        bot_task = asyncio.create_task(run_bot())
-        api_task = asyncio.create_task(server.serve())
-        await asyncio.wait([bot_task, api_task], return_when=asyncio.FIRST_COMPLETED)
+        # 2) BOT を起動
+        bot_task = asyncio.create_task(run_bot(bot, token))
+
+        done, pending = await asyncio.wait(
+            {health_task, bot_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        _shutdown_event.set()
+        for t in pending:
+            t.cancel()
+        for t in done:
+            exc = t.exception()
+            if exc:
+                raise exc
 
     asyncio.run(main_async())
 
