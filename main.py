@@ -5,6 +5,7 @@ Render 用：Discord ボス通知 BOT
  - タスク開始は setup_hook で実行し、"no running event loop" を回避
  - 1分前/出現 通知はチャンネル単位で厳密に重複抑止（TTL）
  - 管理コマンドは「!」省略でも動作（hereon / hereoff / bt / bt3… / bosses / rh / reset / restart）
+ - ★ エイリアス（alias/aliasshow/aliasdel）をギルド単位で保存
 """
 
 import os
@@ -18,7 +19,6 @@ from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
-
 from aiohttp import web
 
 # -------------------- 基本定数 -------------------- #
@@ -103,12 +103,12 @@ class BossBot(commands.Bot):
 
         self.store = Store(STORE_FILE)
         raw = self.store.load()
-        # {guild_id: {bosses:{name:BossState...}, channels:[ids]}}
+        # {guild_id: {bosses:{name:BossState...}, channels:[ids], aliases:{norm_alias: official}}}
         self.data: Dict[str, dict] = raw
 
         # プリセット name -> (respawn_min, rate, first_delay_min)
         self.presets: Dict[str, Tuple[int, int, int]] = {}
-        # normalize(alias) -> official_name
+        # 固定別名（プリセット側） normalize(alias) -> official_name
         self.alias_map: Dict[str, str] = {}
 
         # 送信済みイベント（ギルド別）
@@ -159,7 +159,7 @@ class BossBot(commands.Bot):
 
                 m[name] = (respawn_min, rate, first_delay_min)
 
-                # 別名（必要に応じて増やせます）
+                # 固定別名（必要に応じて増やせます）
                 nkey = normalize_for_match(name)
                 alias[nkey] = name
                 if name == "クイーンアント":
@@ -181,8 +181,27 @@ class BossBot(commands.Bot):
     def _ensure_guild(self, guild_id: int):
         gkey = self._gkey(guild_id)
         if gkey not in self.data:
-            self.data[gkey] = {"bosses": {}, "channels": []}
+            self.data[gkey] = {"bosses": {}, "channels": [], "aliases": {}}
             self.store.save(self.data)
+        else:
+            # 新バージョンで aliases キーが無い既存データを補完
+            if "aliases" not in self.data[gkey]:
+                self.data[gkey]["aliases"] = {}
+                self.store.save(self.data)
+
+    def _guild_aliases(self, guild_id: int) -> Dict[str, str]:
+        self._ensure_guild(guild_id)
+        return self.data[self._gkey(guild_id)].get("aliases", {})
+
+    def _set_guild_alias(self, guild_id: int, norm_alias: str, official: str):
+        self._ensure_guild(guild_id)
+        self.data[self._gkey(guild_id)].setdefault("aliases", {})[norm_alias] = official
+        self.store.save(self.data)
+
+    def _del_guild_alias(self, guild_id: int, norm_alias: str):
+        self._ensure_guild(guild_id)
+        self.data[self._gkey(guild_id)].setdefault("aliases", {}).pop(norm_alias, None)
+        self.store.save(self.data)
 
     def _get_boss(self, guild_id: int, name: str) -> Optional[BossState]:
         g = self.data.get(self._gkey(guild_id), {})
@@ -209,26 +228,36 @@ class BossBot(commands.Bot):
         self.data[self._gkey(guild_id)]["channels"] = ids
         self.store.save(self.data)
 
-    # ----------------- 入力パース ----------------- #
-    def _resolve_boss_name(self, user_text: str) -> Optional[str]:
+    # ----------------- 入力パース（エイリアスはギルド別を優先） ----------------- #
+    def _resolve_boss_name(self, guild_id: int, user_text: str) -> Optional[str]:
+        # ギルド別エイリアス
+        g_alias = self._guild_aliases(guild_id)
+        key = normalize_for_match(user_text)
+        if key in g_alias:
+            return g_alias[key]
+
+        # 正式名一致
         if user_text in self.presets:
             return user_text
-        key = normalize_for_match(user_text)
+
+        # プリセットの固定別名
         if key in self.alias_map:
             return self.alias_map[key]
+
+        # 正式名の前方一致/部分一致
         for off in self.presets.keys():
             n = normalize_for_match(off)
             if n.startswith(key) or key in n:
                 return off
         return None
 
-    def _parse_kill_input(self, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
+    def _parse_kill_input(self, guild_id: int, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
         # 例: 「スタン 1120」 / 「スタン 1120 4h」 / 「フェリス」
         parts = content.strip().split()
         if len(parts) == 0:
             return None
         name_txt = parts[0]
-        off_name = self._resolve_boss_name(name_txt)
+        off_name = self._resolve_boss_name(guild_id, name_txt)
         if not off_name:
             return None
 
@@ -354,7 +383,7 @@ class BossBot(commands.Bot):
             return
 
         # 討伐入力（「ボス名 HHMM [x h]」）
-        parsed = self._parse_kill_input(content)
+        parsed = self._parse_kill_input(message.guild.id, content)
         if parsed:
             name, when_jst, respawn_override = parsed
             st = self._get_boss(message.guild.id, name) or BossState(
@@ -420,7 +449,7 @@ class BossBot(commands.Bot):
         if low.startswith("rh "):
             parts = raw.split()
             if len(parts) >= 3:
-                name = self._resolve_boss_name(parts[1]) or parts[1]
+                name = self._resolve_boss_name(message.guild.id, parts[1]) or parts[1]
                 try:
                     h = float(parts[2].rstrip("hH"))
                     st = self._get_boss(message.guild.id, name) or BossState(
@@ -450,6 +479,64 @@ class BossBot(commands.Bot):
                 await message.channel.send("`reset HHMM` の形式で。")
             return True
 
+        # エイリアス登録: alias <別名> <正式名>
+        if low.startswith("alias "):
+            parts = raw.split(maxsplit=2)
+            if len(parts) < 3:
+                await message.channel.send("`alias 別名 正式名` の形式で指定してください。例: `alias QA クイーンアント`")
+                return True
+            alias_txt = parts[1].strip()
+            official_txt = parts[2].strip()
+
+            # 正式名の解決（プリセット内で）
+            off = self._resolve_boss_name(message.guild.id, official_txt)
+            if not off or off not in self.presets:
+                await message.channel.send(f"正式名が見つかりませんでした: `{official_txt}`\n`bosses` で一覧を確認してください。")
+                return True
+
+            n_alias = normalize_for_match(alias_txt)
+            # 正式名そのものは別名にできない（混乱防止）
+            if n_alias == normalize_for_match(off):
+                await message.channel.send("正式名そのものはエイリアスにできません。別の短縮名を指定してください。")
+                return True
+
+            # 衝突チェック：固定別名とも被らない方が安全
+            if n_alias in self.alias_map and self.alias_map[n_alias] != off:
+                await message.channel.send("その別名は固有エイリアスとして既に使われています。別の名前を指定してください。")
+                return True
+
+            self._set_guild_alias(message.guild.id, n_alias, off)
+            await message.channel.send(f"エイリアスを登録しました：`{alias_txt}` → **{off}**")
+            return True
+
+        # エイリアス削除: aliasdel <別名>
+        if low.startswith("aliasdel "):
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                await message.channel.send("`aliasdel 別名` の形式で指定してください。")
+                return True
+            n_alias = normalize_for_match(parts[1].strip())
+            before = dict(self._guild_aliases(message.guild.id))
+            self._del_guild_alias(message.guild.id, n_alias)
+            if n_alias in before:
+                await message.channel.send(f"エイリアスを削除しました：`{parts[1].strip()}`")
+            else:
+                await message.channel.send("その別名は登録されていません。")
+            return True
+
+        # エイリアス一覧: aliasshow
+        if low == "aliasshow":
+            g_alias = self._guild_aliases(message.guild.id)
+            if not g_alias:
+                await message.channel.send("エイリアスは登録されていません。`alias 別名 正式名` で登録できます。")
+                return True
+            lines = ["【エイリアス一覧】"]
+            # 表示は登録順は保持しないので簡易ソート
+            for k in sorted(g_alias.keys()):
+                lines.append(f"• `{k}` → {g_alias[k]}")
+            await message.channel.send("\n".join(lines))
+            return True
+
         # 再起動
         if low == "restart":
             await message.channel.send("再起動します。保存済みデータは引き継ぎます…")
@@ -470,9 +557,10 @@ class BossBot(commands.Bot):
             "- 一覧：`bt` / `bt3` / `bt6` / `bt12` / `bt24`（!省略OK）\n"
             "- 監視ON/OFF：`hereon` / `hereoff`\n"
             "- 周期変更：`rh ボス名 8h`\n"
-            "- 一覧(プリセット)：`bosses`\n"
+            "- プリセット一覧：`bosses`\n"
             "- 全体リセット：`reset HHMM`\n"
             "- 再起動：`restart`（Render が自動再起動）\n"
+            "- エイリアス：`alias 別名 正式名` / `aliasdel 別名` / `aliasshow`\n"
         )
 
     async def _reset_all(self, guild_id: int, base_jst: datetime):
