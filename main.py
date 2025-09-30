@@ -1,4 +1,11 @@
-
+# main.py
+# Lineage2M Boss Bot (JST固定 / Render運用)
+# - 討伐入力: 「ボス名 HHMM [8h]」 or 「ボス名」（入力時刻）
+# - 一覧: bt / bt3 / bt6 / bt12 / bt24 （"!" なしでも可）
+# - 通知: 1分前(⏰)＆出現(🔥)を±60秒で集約、skip自動加算
+# - チャンネル固定: hereon / hereoff
+# - 429/1015を検出したらバックオフ → 再接続
+# - Render用 FastAPI /health（GET/HEAD対応）
 
 import os
 import json
@@ -55,7 +62,6 @@ def normalize_name(s: str) -> str:
     return s
 
 # ----------- エイリアス -----------
-# 例：クイーンアント→ qa/QA/クイアン など
 ALIASES = {
     "クイーンアント": ["QA", "qa", "クイアン", "クィーンアント", "くいーんあんと"],
     "チェルトゥバ": ["チェトゥバ", "チェトゥルゥバ", "チェルトゥヴァ"],
@@ -66,7 +72,6 @@ ALIASES = {
     "コルーン": ["COLUN", "colun", "こるーん"],
     "グラーキ": ["glaaki", "GLAAKI", "ぐらーき"],
     "スタン": ["stan", "STAN", "すたん"],
-    # 必要に応じて追加
 }
 
 def build_alias_map():
@@ -81,10 +86,9 @@ ALIAS_MAP = build_alias_map()
 
 def unify_boss_name(raw: str) -> str:
     key = normalize_name(raw)
-    # 先に完全一致（カタカナ正規形）を見て、なければエイリアス解決
     if key in ALIAS_MAP:
         return ALIAS_MAP[key]
-    return raw  # 未知はそのまま扱う
+    return raw
 
 # ----------- モデル -----------
 @dataclass
@@ -95,7 +99,6 @@ class BossState:
     next_spawn_utc: Optional[int] = None
     skip: int = 0
 
-    # 表示フラグ
     def label_flags(self) -> str:
         parts = []
         if self.rate == 100:
@@ -125,14 +128,16 @@ class Store:
 class BossBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # メッセージ本文が必要
-        super().__init__(command_prefix="!", intents=intents)
+        intents.message_content = True
+
+        # ★ デフォルトの help を無効化（自作 help と衝突しないように）
+        super().__init__(command_prefix="!", intents=intents, help_command=None)
 
         self.store = Store(STORE_FILE)
         self.db: dict = self.store.load()  # {"guilds": {gid: {"here": cid, "bosses": {name: BossState}}}}
         self.presets = self._load_presets()  # name -> (respawn_min, rate, initial_delay_min)
 
-        # コマンド登録（!ありのコマンド）
+        # コマンド登録
         self.add_command(self.cmd_help)
         self.add_command(self.hereon)
         self.add_command(self.hereoff)
@@ -142,13 +147,13 @@ class BossBot(commands.Bot):
         self.add_command(self.bt12)
         self.add_command(self.bt24)
 
-    # -------------- 公式の起動準備フック：ここで Loop を start する --------------
     async def setup_hook(self):
+        # ここで tasks.loop を start（イベントループが確実に存在する）
         if not self.tick.is_running():
             self.tick.start()
         log.info("setup_hook: background loop started")
 
-    # -------------- ストアUtil --------------
+    # -------------- ストア --------------
     def _g(self, guild_id: int) -> dict:
         gid = str(guild_id)
         if "guilds" not in self.db:
@@ -186,10 +191,6 @@ class BossBot(commands.Bot):
 
     # -------------- 入力パース --------------
     def _parse_quick_input(self, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
-        """
-        高速入力: 「ボス名 HHMM [周期h]」または「ボス名」
-        戻り: (boss_name, base_time_jst, respawn_min_override)
-        """
         parts = content.strip().split()
         if not parts:
             return None
@@ -197,18 +198,18 @@ class BossBot(commands.Bot):
         raw_name = unify_boss_name(parts[0])
         name = raw_name
 
-        # HHMM
         jst_now = datetime.now(JST)
         base = None
         resp_min = None
 
+        # HHMM
         if len(parts) >= 2 and parts[1].isdigit() and 3 <= len(parts[1]) <= 4:
             p = parts[1].zfill(4)
             h, m = int(p[:2]), int(p[2:])
             try:
                 t = jst_now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if t > jst_now:
-                    t -= timedelta(days=1)  # 未来は前日扱い
+                    t -= timedelta(days=1)
                 base = t
             except ValueError:
                 base = None
@@ -216,6 +217,7 @@ class BossBot(commands.Bot):
         if base is None:
             base = jst_now
 
+        # 可変周期（8h等）
         if len(parts) >= 3 and parts[2].lower().endswith("h"):
             try:
                 resp_min = int(round(float(parts[2][:-1]) * 60))
@@ -231,9 +233,8 @@ class BossBot(commands.Bot):
 
         content = message.content.strip()
 
-        # "!" なしの簡易コマンドをフック（hereon/hereoff は!無しでもOK）
+        # "!" なし簡易コマンド（help/here系はどこでも、一覧はhereonチャンネル限定）
         if content.lower() in {"bt", "bt3", "bt6", "bt12", "bt24", "help", "hereon", "hereoff"}:
-            # チャンネル制限：help/hereon/hereoff はどこでもOK
             if content.lower() == "help":
                 await self._send_help(message.channel)
                 return
@@ -244,7 +245,6 @@ class BossBot(commands.Bot):
                 await self._cmd_hereoff(message.channel)
                 return
 
-            # 一覧は hereon のみに限定
             if not self._is_allowed_channel(message.guild.id, message.channel.id):
                 return
 
@@ -256,8 +256,7 @@ class BossBot(commands.Bot):
                 await self._send_bt(message.channel, message.guild.id, hori)
                 return
 
-        # 高速入力（討伐）
-        # → hereon に設定されたチャンネル以外は無視
+        # 討伐入力（hereonチャンネルのみ）
         if not self._is_allowed_channel(message.guild.id, message.channel.id):
             return
 
@@ -271,7 +270,6 @@ class BossBot(commands.Bot):
                 pass
             return
 
-        # 通常のコマンドも動かす
         await self.process_commands(message)
 
     # -------------- チャンネル固定 --------------
@@ -284,7 +282,7 @@ class BossBot(commands.Bot):
         g = self._g(channel.guild.id)
         g["here"] = channel.id
         self._save()
-        await channel.send(f"このチャンネルを通知・操作の対象にしました。")
+        await channel.send("このチャンネルを通知・操作の対象にしました。")
 
     async def _cmd_hereoff(self, channel: discord.TextChannel):
         g = self._g(channel.guild.id)
@@ -297,7 +295,6 @@ class BossBot(commands.Bot):
         g = self._g(guild_id)
         bosses = g["bosses"]
 
-        # 既定：1h
         st = BossState(name=name, respawn_min=60, rate=100)
         if name in self.presets:
             resp_min, rate, initial_delay_min = self.presets[name]
@@ -309,9 +306,7 @@ class BossBot(commands.Bot):
         if respawn_min_override:
             st.respawn_min = respawn_min_override
 
-        # 初回遅延の扱い：
-        # 100%＆初回遅延0 → 手動入力前提（=遅延付与なし）
-        # プリセットにある initial_delay_min が >0 の場合：それを加える
+        # 初回遅延の扱い
         add_delay = 0
         if name in self.presets:
             _, _, initial_delay_min = self.presets[name]
@@ -348,7 +343,7 @@ class BossBot(commands.Bot):
             if current_hour is None:
                 current_hour = j.hour
             if j.hour != current_hour:
-                lines.append("")  # 改行1つ（見やすく段落）
+                lines.append("")  # 改行1つ
                 current_hour = j.hour
             lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".rstrip())
         await channel.send("\n".join(lines))
@@ -360,12 +355,12 @@ class BossBot(commands.Bot):
             "  時刻省略で入力時刻。未来HHMMは前日扱い。\n"
             "• 一覧: `bt` / `bt3` / `bt6` / `bt12` / `bt24`（!なしでOK）\n"
             "• チャンネル固定: `hereon` / `hereoff`\n"
-            "• 出現率100%は「※確定」を付与。出現未入力は自動で次周へ回り(skip加算)。\n"
-            "• エイリアス: ひらがな/カタカナ/一部一致/QA などを極力吸収。\n"
+            "• 出現率100%は「※確定」。出現未入力は自動次周（skip加算）。\n"
+            "• エイリアス: ひらがな/カタカナ/一部一致/QA など対応。\n"
         )
         await channel.send(txt)
 
-    # -------------- コマンド（!でも呼べる） --------------
+    # -------------- コマンド --------------
     @commands.command(name="help")
     async def cmd_help(self, ctx: commands.Context):
         await self._send_help(ctx.channel)
@@ -420,7 +415,6 @@ class BossBot(commands.Bot):
                 continue
 
             here_ch_id = gdata.get("here")
-            # 送信先：hereon があればそこ、無ければ各ボスを最後に登録した場所（今回は省略→hereon優先）
             if not here_ch_id:
                 continue  # 通知は hereon 設定時のみ
 
@@ -452,7 +446,6 @@ class BossBot(commands.Bot):
                     st.skip += 1
                     gdata["bosses"][st.name] = asdict(st)
 
-            # 送信（集約）
             if pre_items:
                 try:
                     await ch.send("⏰ 1分前\n" + "\n".join(sorted(pre_items)))
@@ -472,14 +465,19 @@ class BossBot(commands.Bot):
 
 # ----------- FastAPI（/health） -----------
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response
 from uvicorn import Config, Server
 
 app = FastAPI()
 
 @app.get("/health")
-async def health(silent: Optional[int] = None):
-    # ヘルスチェック：UptimeRobot/cron-job.org から叩かれる
+async def health_get(silent: Optional[int] = None):
     return {"ok": True, "ts": int(time.time())}
+
+# ★ HEAD でも 200/204 を返す（監視系がHEADで叩いても405にしない）
+@app.head("/health")
+async def health_head():
+    return Response(status_code=204)
 
 # ----------- 起動（429レート制限に耐えるリトライ） -----------
 async def main_async():
@@ -496,7 +494,6 @@ async def main_async():
                 log.info("discord: starting")
                 await bot.start(token)
             except discord.errors.HTTPException as e:
-                # Cloudflare/Discordの429をハンドリング
                 status = getattr(e, "status", None)
                 if status == 429:
                     backoff = BACKOFF_429_MIN * 60 + random.randint(0, BACKOFF_JITTER_SEC)
@@ -518,4 +515,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
