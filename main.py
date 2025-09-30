@@ -1,43 +1,101 @@
-# -*- coding: utf-8 -*-
+
+
 import os
 import json
+import math
+import time
+import random
 import asyncio
-import unicodedata
+import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import discord
-from discord.ext import tasks
-from fastapi import FastAPI
-from uvicorn import Config, Server
+from discord.ext import commands, tasks
 
-# ====== JST（固定） ======
+# ----------- ログ -----------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bossbot")
+
+# ----------- 時刻・定数 -----------
 JST = timezone(timedelta(hours=9))
-
-# ====== パス ======
 DATA_DIR = "data"
 STORE_FILE = os.path.join(DATA_DIR, "store.json")
-PRESET_FILE = "bosses_preset.json"
-
-# ====== 通知の集約ウィンドウ ======
+PRESET_FILE = "bosses_preset.json"  # 同ディレクトリに置く
 CHECK_SEC = 10
-MERGE_WINDOW_SEC = 60  # ±60秒で1分前／出現を集約
+MERGE_WINDOW_SEC = 60  # 通知集約±秒
 
-# ---------------- Data Models ---------------- #
+# 429 バックオフ（Render の Environment Variables で上書き可）
+BACKOFF_429_MIN = int(os.environ.get("BACKOFF_429_MIN", "900"))  # 15分
+BACKOFF_JITTER_SEC = int(os.environ.get("BACKOFF_JITTER_SEC", "30"))
+
+# ----------- ユーティリティ -----------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def to_jst(ts: int) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(JST)
+
+def hira_to_kata(s: str) -> str:
+    # ひらがな→カタカナ正規化
+    res = []
+    for ch in s:
+        code = ord(ch)
+        if 0x3041 <= code <= 0x3096:
+            res.append(chr(code + 0x60))
+        else:
+            res.append(ch)
+    return "".join(res)
+
+def normalize_name(s: str) -> str:
+    s = s.strip().replace("　", " ")
+    s = "".join(s.split())  # 空白除去
+    s = hira_to_kata(s)
+    return s
+
+# ----------- エイリアス -----------
+# 例：クイーンアント→ qa/QA/クイアン など
+ALIASES = {
+    "クイーンアント": ["QA", "qa", "クイアン", "クィーンアント", "くいーんあんと"],
+    "チェルトゥバ": ["チェトゥバ", "チェトゥルゥバ", "チェルトゥヴァ"],
+    "ティミニエル": ["ティミ", "てぃみにえる"],
+    "ガレス": ["GARETH", "gareth", "がれす"],
+    "ベヒモス": ["べひ", "BEHEMOTH", "behemoth"],
+    "オルフェン": ["ORFEN", "orfen", "おるふぇん"],
+    "コルーン": ["COLUN", "colun", "こるーん"],
+    "グラーキ": ["glaaki", "GLAAKI", "ぐらーき"],
+    "スタン": ["stan", "STAN", "すたん"],
+    # 必要に応じて追加
+}
+
+def build_alias_map():
+    m = {}
+    for official, arr in ALIASES.items():
+        m[normalize_name(official)] = official
+        for a in arr:
+            m[normalize_name(a)] = official
+    return m
+
+ALIAS_MAP = build_alias_map()
+
+def unify_boss_name(raw: str) -> str:
+    key = normalize_name(raw)
+    # 先に完全一致（カタカナ正規形）を見て、なければエイリアス解決
+    if key in ALIAS_MAP:
+        return ALIAS_MAP[key]
+    return raw  # 未知はそのまま扱う
+
+# ----------- モデル -----------
 @dataclass
 class BossState:
     name: str
-    respawn_min: int               # 周期（分）
-    rate: int = 100                # 出現率（%）
+    respawn_min: int          # 周期（分）
+    rate: int = 100           # 出現率（%）
     next_spawn_utc: Optional[int] = None
-    channel_id: Optional[int] = None
     skip: int = 0
-    excluded_reset: bool = False
-    initial_delay_min: int = 0
-    last_pre_minute_utc: Optional[int] = None   # 最後に1分前通知した「分」のUTC epoch（重複防止）
-    last_spawn_minute_utc: Optional[int] = None # 最後に出現通知した「分」のUTC epoch（重複防止）
 
+    # 表示フラグ
     def label_flags(self) -> str:
         parts = []
         if self.rate == 100:
@@ -46,233 +104,242 @@ class BossState:
             parts.append(f"{self.skip}周")
         return "[" + "] [".join(parts) + "]" if parts else ""
 
-
-# ---------------- Storage ---------------- #
+# ----------- ストア -----------
 class Store:
-    """
-    保存形式:
-    {
-      "<guild_id>": {
-        "meta": {"announce_channel_id": 1234567890},
-        "bosses": {
-          "メデューサ": {...BossState...},
-          ...
-        }
-      }
-    }
-    """
     def __init__(self, path: str):
         self.path = path
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         if not os.path.exists(self.path):
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
+                json.dump({"guilds": {}}, f, ensure_ascii=False)
 
-    def load(self) -> Dict[str, dict]:
+    def load(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def save(self, data: Dict[str, dict]):
+    def save(self, data: dict):
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# ---------------- Utility: 文字正規化 / ボス名解決 ---------------- #
-def kata_to_hira(s: str) -> str:
-    # カタカナ→ひらがな
-    res = []
-    for ch in s:
-        code = ord(ch)
-        if 0x30A1 <= code <= 0x30F6:
-            res.append(chr(code - 0x60))
-        else:
-            res.append(ch)
-    return "".join(res)
-
-def normalize_key(s: str) -> str:
-    # 全角→半角・小文字・空白除去・カタカナ→ひらがな
-    s = unicodedata.normalize("NFKC", s).lower().strip()
-    s = s.replace(" ", "").replace("　", "")
-    s = kata_to_hira(s)
-    return s
-
-def unique_startswith(target: str, candidates: List[str]) -> Optional[str]:
-    # 正規化で startswith 一意なら返す
-    key = normalize_key(target)
-    hits = [c for c in candidates if normalize_key(c).startswith(key)]
-    if len(hits) == 1:
-        return hits[0]
-    return None
-
-# ひらがな/カタカナ/一部一致/アルファベット(例: QA) のゆるエイリアス
-def build_alias_map(officials: List[str]) -> Dict[str, str]:
-    m = {}
-    # 例: クイーンアント → qa
-    m["qa"] = "クイーンアント"
-    m["queenant"] = "クイーンアント"
-    m["orfen"] = "オルフェン"
-    m["timini"] = "ティミニエル"
-    m["timiniel"] = "ティミニエル"
-    m["medusa"] = "メデューサ"
-    m["gareth"] = "ガレス"
-    m["behemoth"] = "ベヒモス"
-    m["panarlord"] = "パンナロード"
-    m["coreceptor"] = "コアサセプタ"
-    m["koreceptor"] = "コアサセプタ"
-
-    # 同音のかな名も直参照できるように
-    for off in officials:
-        m[normalize_key(off)] = off
-    return m
-
-def resolve_boss_name(name_in: str, alias_map: Dict[str, str], officials: List[str]) -> Optional[str]:
-    if not name_in:
-        return None
-    k = normalize_key(name_in)
-    # 直接 alias
-    if k in alias_map:
-        return alias_map[k]
-    # 一意の前方一致
-    hit = unique_startswith(name_in, officials)
-    if hit:
-        return hit
-    # 公式名そのもの（空白/全半角の違いなど）を吸収
-    for off in officials:
-        if normalize_key(off) == k:
-            return off
-    return None
-
-
-# ---------------- Bot ---------------- #
-class BossBot(discord.Client):
+# ----------- Bot 本体 -----------
+class BossBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # メッセージ内容の取得をON
-        super().__init__(intents=intents)
+        intents.message_content = True  # メッセージ本文が必要
+        super().__init__(command_prefix="!", intents=intents)
+
         self.store = Store(STORE_FILE)
-        self.data: Dict[str, dict] = self.store.load()  # guild -> {"meta":{}, "bosses":{}}
-        self.presets: Dict[str, Tuple[int, int, int]] = {}  # name -> (respawn_min, rate, initial_delay_min)
-        self.officials: List[str] = []
-        self.alias_map: Dict[str, str] = {}
-        self._load_presets()
-        self.tick.start()
+        self.db: dict = self.store.load()  # {"guilds": {gid: {"here": cid, "bosses": {name: BossState}}}}
+        self.presets = self._load_presets()  # name -> (respawn_min, rate, initial_delay_min)
 
-    # ---------- storage helpers ---------- #
-    def _gkey(self, guild_id: int) -> str:
-        return str(guild_id)
+        # コマンド登録（!ありのコマンド）
+        self.add_command(self.cmd_help)
+        self.add_command(self.hereon)
+        self.add_command(self.hereoff)
+        self.add_command(self.bt)
+        self.add_command(self.bt3)
+        self.add_command(self.bt6)
+        self.add_command(self.bt12)
+        self.add_command(self.bt24)
 
-    def _ensure_guild(self, guild_id: int):
-        gk = self._gkey(guild_id)
-        if gk not in self.data:
-            self.data[gk] = {"meta": {}, "bosses": {}}
+    # -------------- 公式の起動準備フック：ここで Loop を start する --------------
+    async def setup_hook(self):
+        if not self.tick.is_running():
+            self.tick.start()
+        log.info("setup_hook: background loop started")
 
-    def _get(self, guild_id: int, name: str) -> Optional[BossState]:
-        self._ensure_guild(guild_id)
-        d = self.data[self._gkey(guild_id)]["bosses"].get(name)
-        return BossState(**d) if d else None
+    # -------------- ストアUtil --------------
+    def _g(self, guild_id: int) -> dict:
+        gid = str(guild_id)
+        if "guilds" not in self.db:
+            self.db["guilds"] = {}
+        if gid not in self.db["guilds"]:
+            self.db["guilds"][gid] = {"bosses": {}, "here": None}
+        return self.db["guilds"][gid]
 
-    def _set(self, guild_id: int, st: BossState):
-        self._ensure_guild(guild_id)
-        self.data[self._gkey(guild_id)]["bosses"][st.name] = asdict(st)
-        self.store.save(self.data)
+    def _save(self):
+        self.store.save(self.db)
 
-    def _all(self, guild_id: int) -> List[BossState]:
-        self._ensure_guild(guild_id)
-        return [BossState(**d) for d in self.data[self._gkey(guild_id)]["bosses"].values()]
-
-    def _get_announce_channel(self, guild_id: int) -> Optional[int]:
-        self._ensure_guild(guild_id)
-        return self.data[self._gkey(guild_id)]["meta"].get("announce_channel_id")
-
-    def _set_announce_channel(self, guild_id: int, channel_id: Optional[int]):
-        self._ensure_guild(guild_id)
-        if channel_id is None:
-            self.data[self._gkey(guild_id)]["meta"].pop("announce_channel_id", None)
-        else:
-            self.data[self._gkey(guild_id)]["meta"]["announce_channel_id"] = channel_id
-        self.store.save(self.data)
-
-    # ---------- presets ---------- #
-    def _load_presets(self):
+    def _load_presets(self) -> Dict[str, Tuple[int, int, int]]:
+        """
+        bosses_preset.json の形式（例）:
+        [
+          {"name":"フェリス","rate":50,"respawn_h":2,"initial_delay_h":0},
+          ...
+        ]
+        """
         try:
             with open(PRESET_FILE, "r", encoding="utf-8") as f:
                 arr = json.load(f)
-            self.presets = {}
-            self.officials = []
+            res = {}
             for x in arr:
                 name = x["name"]
-                rate = int(x.get("rate", x.get("出現率", 100)))
-                # respawn_h は小数対応
-                rh = x.get("respawn_h")
-                if rh is None:
-                    # 誤キーにもある程度耐性
-                    rh = x.get("間隔") or x.get("respawn") or x.get("interval_h")
-                respawn_min = int(round(float(rh) * 60))
-                delay_h = x.get("initial_delay_h", x.get("初回出現遅延", 0))
-                # H:MM で渡ってくるケースも想定してパース
-                if isinstance(delay_h, str) and ":" in delay_h:
-                    h, m = delay_h.split(":")
-                    delay_min = int(h) * 60 + int(m)
-                else:
-                    delay_min = int(round(float(delay_h) * 60))
-                self.presets[name] = (respawn_min, rate, delay_min)
-                self.officials.append(name)
-            self.alias_map = build_alias_map(self.officials)
-            print(f"presets loaded: {len(self.presets)}")
+                respawn_min = int(round(float(x.get("respawn_h", 0)) * 60))
+                rate = int(x.get("rate", 100))
+                initial_delay_min = int(round(float(x.get("initial_delay_h", 0)) * 60))
+                res[name] = (respawn_min, rate, initial_delay_min)
+            log.info(f"presets loaded: {len(res)} bosses")
+            return res
         except Exception as e:
-            print("preset load error:", e)
-            self.presets = {}
-            self.officials = []
-            self.alias_map = {}
+            log.warning(f"presets load failed: {e}")
+            return {}
 
-    # ---------- 入力パース（ボス名 HHMM [8h] / ボス名のみ） ---------- #
-    def parse_quick_input(self, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
+    # -------------- 入力パース --------------
+    def _parse_quick_input(self, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
+        """
+        高速入力: 「ボス名 HHMM [周期h]」または「ボス名」
+        戻り: (boss_name, base_time_jst, respawn_min_override)
+        """
         parts = content.strip().split()
-        if len(parts) == 0:
+        if not parts:
             return None
-        name = parts[0]
-        jst_now = datetime.now(JST)
-        base = jst_now
-        respawn_min = None
+
+        raw_name = unify_boss_name(parts[0])
+        name = raw_name
 
         # HHMM
+        jst_now = datetime.now(JST)
+        base = None
+        resp_min = None
+
         if len(parts) >= 2 and parts[1].isdigit() and 3 <= len(parts[1]) <= 4:
             p = parts[1].zfill(4)
+            h, m = int(p[:2]), int(p[2:])
             try:
-                h, m = int(p[:2]), int(p[2:])
-                base = jst_now.replace(hour=h, minute=m, second=0, microsecond=0)
-                # 未来は前日扱い
-                if base > jst_now:
-                    base -= timedelta(days=1)
+                t = jst_now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if t > jst_now:
+                    t -= timedelta(days=1)  # 未来は前日扱い
+                base = t
             except ValueError:
-                base = jst_now
+                base = None
 
-        # 8h のような周期上書き
+        if base is None:
+            base = jst_now
+
         if len(parts) >= 3 and parts[2].lower().endswith("h"):
             try:
-                respawn_min = int(round(float(parts[2][:-1]) * 60))
+                resp_min = int(round(float(parts[2][:-1]) * 60))
             except ValueError:
-                respawn_min = None
+                resp_min = None
 
-        return name, base, respawn_min
+        return name, base, resp_min
 
-    # ---------- 表示（bt系） ---------- #
+    # -------------- メッセージ受信 --------------
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+
+        content = message.content.strip()
+
+        # "!" なしの簡易コマンドをフック（hereon/hereoff は!無しでもOK）
+        if content.lower() in {"bt", "bt3", "bt6", "bt12", "bt24", "help", "hereon", "hereoff"}:
+            # チャンネル制限：help/hereon/hereoff はどこでもOK
+            if content.lower() == "help":
+                await self._send_help(message.channel)
+                return
+            if content.lower() == "hereon":
+                await self._cmd_hereon(message.channel)
+                return
+            if content.lower() == "hereoff":
+                await self._cmd_hereoff(message.channel)
+                return
+
+            # 一覧は hereon のみに限定
+            if not self._is_allowed_channel(message.guild.id, message.channel.id):
+                return
+
+            if content.lower() == "bt":
+                await self._send_bt(message.channel, message.guild.id, None)
+                return
+            hori = {"bt3": 3, "bt6": 6, "bt12": 12, "bt24": 24}.get(content.lower())
+            if hori:
+                await self._send_bt(message.channel, message.guild.id, hori)
+                return
+
+        # 高速入力（討伐）
+        # → hereon に設定されたチャンネル以外は無視
+        if not self._is_allowed_channel(message.guild.id, message.channel.id):
+            return
+
+        parsed = self._parse_quick_input(content)
+        if parsed:
+            name, when_jst, respawn_min_override = parsed
+            await self._handle_kill_input(message.guild.id, name, when_jst, respawn_min_override)
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
+            return
+
+        # 通常のコマンドも動かす
+        await self.process_commands(message)
+
+    # -------------- チャンネル固定 --------------
+    def _is_allowed_channel(self, guild_id: int, channel_id: int) -> bool:
+        g = self._g(guild_id)
+        here = g.get("here")
+        return here is None or here == channel_id
+
+    async def _cmd_hereon(self, channel: discord.TextChannel):
+        g = self._g(channel.guild.id)
+        g["here"] = channel.id
+        self._save()
+        await channel.send(f"このチャンネルを通知・操作の対象にしました。")
+
+    async def _cmd_hereoff(self, channel: discord.TextChannel):
+        g = self._g(channel.guild.id)
+        g["here"] = None
+        self._save()
+        await channel.send("チャンネル固定を解除しました。（どのチャンネルでも操作可能）")
+
+    # -------------- 討伐入力 --------------
+    async def _handle_kill_input(self, guild_id: int, name: str, when_jst: datetime, respawn_min_override: Optional[int]):
+        g = self._g(guild_id)
+        bosses = g["bosses"]
+
+        # 既定：1h
+        st = BossState(name=name, respawn_min=60, rate=100)
+        if name in self.presets:
+            resp_min, rate, initial_delay_min = self.presets[name]
+            st.respawn_min = resp_min
+            st.rate = rate
+        if name in bosses:
+            st = BossState(**bosses[name])
+
+        if respawn_min_override:
+            st.respawn_min = respawn_min_override
+
+        # 初回遅延の扱い：
+        # 100%＆初回遅延0 → 手動入力前提（=遅延付与なし）
+        # プリセットにある initial_delay_min が >0 の場合：それを加える
+        add_delay = 0
+        if name in self.presets:
+            _, _, initial_delay_min = self.presets[name]
+            if initial_delay_min and initial_delay_min > 0:
+                add_delay = initial_delay_min
+
+        center_utc = when_jst.astimezone(timezone.utc) + timedelta(minutes=st.respawn_min + add_delay)
+        st.next_spawn_utc = int(center_utc.timestamp())
+        st.skip = 0
+
+        bosses[name] = asdict(st)
+        self._save()
+
+    # -------------- 一覧出力 --------------
     async def _send_bt(self, channel: discord.TextChannel, guild_id: int, horizon_h: Optional[int]):
-        arr = self._all(guild_id)
+        g = self._g(guild_id)
+        arr = [BossState(**d) for d in g["bosses"].values() if d.get("next_spawn_utc")]
         now = now_utc()
         items = []
         for st in arr:
-            if not st.next_spawn_utc:
-                continue
             t = datetime.fromtimestamp(st.next_spawn_utc, tz=timezone.utc)
-            if horizon_h is not None and (t - now).total_seconds() > horizon_h * 3600:
-                continue
-            items.append((t, st))
+            if horizon_h is None or (t - now).total_seconds() <= horizon_h * 3600:
+                items.append((t, st))
         items.sort(key=lambda x: x[0])
+
+        if not items:
+            await channel.send("予定はありません。")
+            return
 
         lines = []
         current_hour = None
@@ -281,225 +348,173 @@ class BossBot(discord.Client):
             if current_hour is None:
                 current_hour = j.hour
             if j.hour != current_hour:
-                lines.append("")  # 改行1つ（指定どおり）
+                lines.append("")  # 改行1つ（見やすく段落）
                 current_hour = j.hour
-            lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.label_flags()}")
+            lines.append(f"{j.strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".rstrip())
+        await channel.send("\n".join(lines))
 
-        if not lines:
-            await channel.send("予定はありません。")
-        else:
-            await channel.send("\n".join(lines))
+    async def _send_help(self, channel: discord.TextChannel):
+        txt = (
+            "使い方（JST固定）\n"
+            "• 討伐入力: `ボス名 HHMM [8h]` 例) `メデューサ 2208` / `ティミニエル 1121 8h`\n"
+            "  時刻省略で入力時刻。未来HHMMは前日扱い。\n"
+            "• 一覧: `bt` / `bt3` / `bt6` / `bt12` / `bt24`（!なしでOK）\n"
+            "• チャンネル固定: `hereon` / `hereoff`\n"
+            "• 出現率100%は「※確定」を付与。出現未入力は自動で次周へ回り(skip加算)。\n"
+            "• エイリアス: ひらがな/カタカナ/一部一致/QA などを極力吸収。\n"
+        )
+        await channel.send(txt)
 
-    async def _notify_grouped(self, guild: discord.Guild, items_by_cid: Dict[int, List[str]], title_emoji: str):
-        for cid, arr in items_by_cid.items():
-            ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
-            if not ch:
-                continue
-            await ch.send(f"{title_emoji} " + "\n".join(sorted(arr)))
+    # -------------- コマンド（!でも呼べる） --------------
+    @commands.command(name="help")
+    async def cmd_help(self, ctx: commands.Context):
+        await self._send_help(ctx.channel)
 
-    # ---------- 周期チェック ---------- #
+    @commands.command(name="hereon")
+    async def hereon(self, ctx: commands.Context):
+        await self._cmd_hereon(ctx.channel)
+
+    @commands.command(name="hereoff")
+    async def hereoff(self, ctx: commands.Context):
+        await self._cmd_hereoff(ctx.channel)
+
+    @commands.command(name="bt")
+    async def bt(self, ctx: commands.Context):
+        if not self._is_allowed_channel(ctx.guild.id, ctx.channel.id):
+            return
+        await self._send_bt(ctx.channel, ctx.guild.id, None)
+
+    @commands.command(name="bt3")
+    async def bt3(self, ctx: commands.Context):
+        if not self._is_allowed_channel(ctx.guild.id, ctx.channel.id):
+            return
+        await self._send_bt(ctx.channel, ctx.guild.id, 3)
+
+    @commands.command(name="bt6")
+    async def bt6(self, ctx: commands.Context):
+        if not self._is_allowed_channel(ctx.guild.id, ctx.channel.id):
+            return
+        await self._send_bt(ctx.channel, ctx.guild.id, 6)
+
+    @commands.command(name="bt12")
+    async def bt12(self, ctx: commands.Context):
+        if not self._is_allowed_channel(ctx.guild.id, ctx.channel.id):
+            return
+        await self._send_bt(ctx.channel, ctx.guild.id, 12)
+
+    @commands.command(name="bt24")
+    async def bt24(self, ctx: commands.Context):
+        if not self._is_allowed_channel(ctx.guild.id, ctx.channel.id):
+            return
+        await self._send_bt(ctx.channel, ctx.guild.id, 24)
+
+    # -------------- 通知ループ --------------
     @tasks.loop(seconds=CHECK_SEC)
     async def tick(self):
         await self.wait_until_ready()
         now = now_utc()
-        for gkey, gdict in list(self.data.items()):
-            guild = self.get_guild(int(gkey))
+
+        for gid, gdata in list(self.db.get("guilds", {}).items()):
+            guild = self.get_guild(int(gid))
             if not guild:
                 continue
 
-            pre_items: Dict[int, List[str]] = {}
-            now_items: Dict[int, List[str]] = {}
+            here_ch_id = gdata.get("here")
+            # 送信先：hereon があればそこ、無ければ各ボスを最後に登録した場所（今回は省略→hereon優先）
+            if not here_ch_id:
+                continue  # 通知は hereon 設定時のみ
 
-            bosses = [BossState(**d) for d in gdict.get("bosses", {}).values()]
-            fixed_cid = gdict.get("meta", {}).get("announce_channel_id")
+            try:
+                ch = guild.get_channel(here_ch_id) or await guild.fetch_channel(here_ch_id)
+            except Exception:
+                continue
 
-            for st in bosses:
+            pre_items = []  # 1分前
+            now_items = []  # 出現
+
+            for d in list(gdata.get("bosses", {}).values()):
+                st = BossState(**d)
                 if not st.next_spawn_utc:
                     continue
-
                 center = datetime.fromtimestamp(st.next_spawn_utc, tz=timezone.utc)
-                # 通知先は固定チャンネルがあればそちら
-                target_cid = fixed_cid or st.channel_id
-                if not target_cid:
-                    continue
 
-                # 1分前（重複防止: 分で同一ならスキップ）
-                pre_center = center - timedelta(minutes=1)
-                if abs((now - pre_center).total_seconds()) <= MERGE_WINDOW_SEC:
-                    minute_key = int(pre_center.replace(second=0, microsecond=0).timestamp())
-                    if st.last_pre_minute_utc != minute_key:
-                        label = f"{center.astimezone(JST).strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".strip()
-                        pre_items.setdefault(target_cid, []).append(label)
-                        st.last_pre_minute_utc = minute_key
-                        self._set(int(gkey), st)
+                # 1分前
+                if abs((now - (center - timedelta(minutes=1))).total_seconds()) <= MERGE_WINDOW_SEC:
+                    pre_items.append(f"{center.astimezone(JST).strftime('%H:%M:%S')} : {st.name} {st.label_flags()}".strip())
 
-                # 出現（重複防止）
+                # 出現
                 if abs((now - center).total_seconds()) <= MERGE_WINDOW_SEC:
-                    minute_key = int(center.replace(second=0, microsecond=0).timestamp())
-                    if st.last_spawn_minute_utc != minute_key:
-                        label = f"{st.name} 出現！ [{center.astimezone(JST).strftime('%H:%M:%S')}] (skip:{st.skip}) {st.label_flags()}".strip()
-                        now_items.setdefault(target_cid, []).append(label)
-                        st.last_spawn_minute_utc = minute_key
-                        self._set(int(gkey), st)
+                    now_items.append(f"{st.name} 出現！ [{center.astimezone(JST).strftime('%H:%M:%S')}] (skip:{st.skip}) {st.label_flags()}".strip())
 
-                # 自動スライド（出現から60秒過ぎたら次周へ）
+                # 自動スキップ（1分超過）
                 if (now - center).total_seconds() >= 60:
                     st.next_spawn_utc += st.respawn_min * 60
                     st.skip += 1
-                    self._set(int(gkey), st)
+                    gdata["bosses"][st.name] = asdict(st)
 
-            # まとめて送信
-            await self._notify_grouped(guild, pre_items, "⏰ 1分前")
-            await self._notify_grouped(guild, now_items, "🔥")
+            # 送信（集約）
+            if pre_items:
+                try:
+                    await ch.send("⏰ 1分前\n" + "\n".join(sorted(pre_items)))
+                except Exception:
+                    pass
+            if now_items:
+                try:
+                    await ch.send("🔥\n" + "\n".join(sorted(now_items)))
+                except Exception:
+                    pass
+
+        self._save()
 
     @tick.before_loop
     async def before_tick(self):
         await self.wait_until_ready()
 
-    # ---------- メッセージ処理（!無し/!付き両対応 & hereon/hereoff でチャンネル固定） ---------- #
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
-            return
+# ----------- FastAPI（/health） -----------
+from fastapi import FastAPI
+from uvicorn import Config, Server
 
-        text = message.content.strip()
-        gid = message.guild.id
-        fixed_cid = self._get_announce_channel(gid)
-
-        # --- hereon / hereoff はどこでも受け付け ---
-        if text.lower() in ("hereon", "!hereon"):
-            self._set_announce_channel(gid, message.channel.id)
-            await message.channel.send("📌 以後の通知はこのチャンネルに固定します。")
-            return
-
-        if text.lower() in ("hereoff", "!hereoff"):
-            self._set_announce_channel(gid, None)
-            await message.channel.send("📌 通知チャンネルの固定を解除しました。")
-            return
-
-        # --- 固定中は、固定チャンネル以外の入力を**完全無視** ---
-        if fixed_cid and message.channel.id != fixed_cid:
-            return
-
-        # --- bt系 ---
-        low = text.lower()
-        if low in ("bt", "!bt"):
-            await self._send_bt(message.channel, gid, None)
-            return
-        if low in ("bt3", "!bt3"):
-            await self._send_bt(message.channel, gid, 3)
-            return
-        if low in ("bt6", "!bt6"):
-            await self._send_bt(message.channel, gid, 6)
-            return
-        if low in ("bt12", "!bt12"):
-            await self._send_bt(message.channel, gid, 12)
-            return
-        if low in ("bt24", "!bt24"):
-            await self._send_bt(message.channel, gid, 24)
-            return
-
-        # --- rh / preset / help ---
-        if low.startswith(("rh ", "!rh ")):
-            try:
-                _, name, hours = low.replace("!rh", "rh", 1).split(maxsplit=2)
-            except ValueError:
-                return
-            off = resolve_boss_name(name, self.alias_map, self.officials)
-            if not off or off not in self.presets:
-                return
-            st = self._get(gid, off) or BossState(name=off, respawn_min=60)
-            h = float(hours.rstrip("h"))
-            st.respawn_min = int(round(h * 60))
-            self._set(gid, st)
-            await message.channel.send(f"{off} の周期を {st.respawn_min/60:.2f}h に設定しました。")
-            return
-
-        if low in ("preset", "!preset"):
-            self._load_presets()
-            for st in self._all(gid):
-                if st.name in self.presets:
-                    rmin, rate, delay = self.presets[st.name]
-                    st.respawn_min, st.rate, st.initial_delay_min = rmin, rate, delay
-                    self._set(gid, st)
-            await message.channel.send("プリセットを再読込しました。")
-            return
-
-        if low in ("help", "!help"):
-            await message.channel.send(
-                "使い方：\n"
-                "・`ボス名 HHMM [周期h]` 例: `メデューサ 2208` / `ティミニエル 1121 8h`\n"
-                "・`bt / bt3 / bt6 / bt12 / bt24` … 直近一覧（!無しでOK）\n"
-                "・`hereon` / `hereoff` … 通知チャンネルの固定/解除\n"
-                "・`rh ボス名 8h` … 既定周期変更\n"
-                "・`preset` … プリセット再読込\n"
-            )
-            return
-
-        # --- 討伐入力（ボス名 …） ---
-        parsed = self.parse_quick_input(text)
-        if not parsed:
-            return
-        name_in, when_jst, respawn_override = parsed
-
-        # 正式名へ解決。プリセットにない名称は**完全無視**
-        off = resolve_boss_name(name_in, self.alias_map, self.officials)
-        if not off or off not in self.presets:
-            return
-
-        st = self._get(gid, off) or BossState(name=off, respawn_min=60)
-        if off in self.presets:
-            rmin, rate, delay = self.presets[off]
-            if st.respawn_min == 60 and respawn_override is None:
-                st.respawn_min = rmin
-            st.rate = rate
-            st.initial_delay_min = delay
-
-        if respawn_override is not None:
-            st.respawn_min = respawn_override
-
-        # 通知先は固定があれば固定チャンネル
-        st.channel_id = (self._get_announce_channel(gid) or message.channel.id)
-
-        center = when_jst.astimezone(timezone.utc) + timedelta(
-            minutes=st.respawn_min + st.initial_delay_min
-        )
-        st.next_spawn_utc = int(center.timestamp())
-        st.skip = 0
-        st.last_pre_minute_utc = None
-        st.last_spawn_minute_utc = None
-
-        self._set(gid, st)
-        try:
-            await message.add_reaction("✅")
-        except Exception:
-            pass
-
-
-# ---------------- keepalive (FastAPI) ---------------- #
 app = FastAPI()
 
 @app.get("/health")
-async def health():
-    return {"ok": True}
+async def health(silent: Optional[int] = None):
+    # ヘルスチェック：UptimeRobot/cron-job.org から叩かれる
+    return {"ok": True, "ts": int(time.time())}
 
-
-def run():
+# ----------- 起動（429レート制限に耐えるリトライ） -----------
+async def main_async():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set")
 
     bot = BossBot()
+    api = Server(Config(app=app, host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), loop="asyncio", lifespan="on"))
 
-    async def main_async():
-        # Discord & FastAPI を同一ループ内で同時起動
-        config = Config(app=app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), loop="asyncio")
-        server = Server(config)
-        bot_task = asyncio.create_task(bot.start(token))
-        api_task = asyncio.create_task(server.serve())
-        await asyncio.wait([bot_task, api_task], return_when=asyncio.FIRST_COMPLETED)
+    async def run_bot_with_retry():
+        while True:
+            try:
+                log.info("discord: starting")
+                await bot.start(token)
+            except discord.errors.HTTPException as e:
+                # Cloudflare/Discordの429をハンドリング
+                status = getattr(e, "status", None)
+                if status == 429:
+                    backoff = BACKOFF_429_MIN * 60 + random.randint(0, BACKOFF_JITTER_SEC)
+                    log.warning(f"[BOT] 429/RateLimited を検出。{backoff}s 待機して再試行します。")
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+            except Exception as e:
+                log.exception(f"discord fatal: {e}")
+                raise
 
+    await asyncio.gather(
+        api.serve(),
+        run_bot_with_retry(),
+    )
+
+def run():
     asyncio.run(main_async())
-
 
 if __name__ == "__main__":
     run()
