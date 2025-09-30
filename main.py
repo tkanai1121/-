@@ -1,15 +1,24 @@
-# main.py
+# -*- coding: utf-8 -*-
+"""
+Render 用：Discord ボス通知 BOT
+ - /health は aiohttp で内蔵（FastAPI/uvicorn 不要）
+ - タスク開始は setup_hook で実行し、"no running event loop" を回避
+ - 1分前/出現 通知はチャンネル単位で厳密に重複抑止（TTL）
+ - 管理コマンドは「!」省略でも動作（hereon / hereoff / bt / bt3… / bosses / rh / reset / restart）
+"""
+
 import os
 import json
 import asyncio
-import random
 import unicodedata
+import random
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
+
 from aiohttp import web
 
 # -------------------- 基本定数 -------------------- #
@@ -19,13 +28,13 @@ DATA_DIR = "data"
 STORE_FILE = os.path.join(DATA_DIR, "store.json")
 PRESET_FILE = "bosses_preset.json"
 
-# ポーリング周期 / 通知の集約窓 / 重複送信のTTL
+# 通知ループ周期 / 集約窓 / 重複抑止TTL
 CHECK_SEC = 10
 MERGE_WINDOW_SEC = 10
-NOTIFY_DEDUP_TTL_SEC = 120
+NOTIFY_DEDUP_TTL_SEC = 120  # 同じイベントは 120s 以内は再送しない
 
-# 429対策（Cloudflare/Discordレートリミット）
-BACKOFF_429_MIN = int(os.environ.get("BACKOFF_429_MIN", "900"))
+# 429（Cloudflare/Discord）対策
+BACKOFF_429_MIN = int(os.environ.get("BACKOFF_429_MIN", "900"))  # 15分
 BACKOFF_JITTER_SEC = int(os.environ.get("BACKOFF_JITTER_SEC", "30"))
 
 # -------------------- 便利関数 -------------------- #
@@ -46,9 +55,7 @@ def zfill_hhmm(s: str) -> Tuple[int, int]:
     return int(p[:2]), int(p[2:])
 
 def normalize_for_match(s: str) -> str:
-    # 全角→半角、記号除去、大小無視
-    s = unicodedata.normalize("NFKC", s)
-    s = s.lower()
+    s = unicodedata.normalize("NFKC", s).lower()
     return "".join(ch for ch in s if ch.isalnum())
 
 # -------------------- ストレージ -------------------- #
@@ -74,7 +81,7 @@ class BossState:
     name: str
     respawn_min: int
     rate: int = 100
-    first_delay_min: int = 0    # 初回遅延
+    first_delay_min: int = 0
     next_spawn_utc: Optional[int] = None
     channel_id: Optional[int] = None
     skip: int = 0
@@ -87,7 +94,7 @@ class BossState:
             parts.append(f"{self.skip}周")
         return "[" + "] [".join(parts) + "]" if parts else ""
 
-# -------------------- 本体 -------------------- #
+# -------------------- BOT 本体 -------------------- #
 class BossBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -96,53 +103,63 @@ class BossBot(commands.Bot):
 
         self.store = Store(STORE_FILE)
         raw = self.store.load()
-        self.data: Dict[str, dict] = raw  # {guild_id: {bosses:{name:BossState...}, channels:[ids]}}
+        # {guild_id: {bosses:{name:BossState...}, channels:[ids]}}
+        self.data: Dict[str, dict] = raw
 
-        self.presets: Dict[str, Tuple[int, int, int]] = {}  # name -> (respawn_min, rate, first_delay_min)
-        self.alias_map: Dict[str, str] = {}  # normalize(alias) -> official_name
+        # プリセット name -> (respawn_min, rate, first_delay_min)
+        self.presets: Dict[str, Tuple[int, int, int]] = {}
+        # normalize(alias) -> official_name
+        self.alias_map: Dict[str, str] = {}
 
-        # 通知の重複抑止用（ギルドごとに送信済みキーと期限）
+        # 送信済みイベント（ギルド別）
         self._sent_keys: Dict[str, Dict[str, int]] = {}
 
-        # tasks.loop を二重起動しないためのフラグ
-        self._tick_started: bool = False
+        # aiohttp ヘルスサーバ
+        self._health_runner: Optional[web.AppRunner] = None
+        self._health_port: int = int(os.environ.get("PORT", 10000))
 
+    # ---- discord.py v2 正式な初期化フック ---- #
     async def setup_hook(self):
-        # ここではプリセット読込のみ（ループは開始しない）
         self._load_presets()
+        self.tick.start()              # ここでループ開始
+        await self._start_health_app() # 同じイベントループで /health を起動
 
-    # ループ開始は on_ready で一度だけ（←ここが今回の修正ポイント）
-    @commands.Cog.listener()
-    async def on_ready(self):
-        if not self._tick_started:
-            self.tick.start()      # ← running event loop 上で開始
-            self._tick_started = True
-        print(f"[BOT] Logged in as {self.user} (ID: {self.user.id})")
+    async def close(self):
+        # 終了時にヘルスサーバも止める
+        try:
+            if self._health_runner:
+                await self._health_runner.cleanup()
+        finally:
+            await super().close()
 
     # ----------------- プリセット/別名 ----------------- #
     def _load_presets(self):
         try:
             with open(PRESET_FILE, "r", encoding="utf-8") as f:
                 arr = json.load(f)
-            # 例: {"name":"スタン","rate":100,"respawn_h":4,"first_delay_h":"0:00"}
-            m = {}
-            alias = {}
+
+            m: Dict[str, Tuple[int, int, int]] = {}
+            alias: Dict[str, str] = {}
             for row in arr:
                 name = row["name"]
                 rate = int(row.get("rate", 100))
-                respawn_h = row.get("respawn_h", 0)
+                respawn_h = row.get("interval_h") or row.get("respawn_h") or row.get("間隔") or 0
                 respawn_min = int(round(float(respawn_h) * 60))
+
                 first_delay_min = 0
-                if "first_delay_h" in row:
-                    fd = str(row["first_delay_h"])
+                fd = row.get("first_delay_h") or row.get("初回出現遅延") or 0
+                if isinstance(fd, str):
                     if ":" in fd:
                         h, mm = fd.split(":")
                         first_delay_min = int(h) * 60 + int(mm)
                     else:
                         first_delay_min = int(round(float(fd) * 60))
+                else:
+                    first_delay_min = int(round(float(fd) * 60))
+
                 m[name] = (respawn_min, rate, first_delay_min)
 
-                # 別名（必要に応じ追加）
+                # 別名（必要に応じて増やせます）
                 nkey = normalize_for_match(name)
                 alias[nkey] = name
                 if name == "クイーンアント":
@@ -151,8 +168,9 @@ class BossBot(commands.Bot):
 
             self.presets = m
             self.alias_map = alias
+            print(f"INFO: bosses preset loaded: {len(self.presets)} bosses")
         except Exception as e:
-            print("preset load error:", e)
+            print("WARN: preset load error:", e)
             self.presets = {}
             self.alias_map = {}
 
@@ -199,11 +217,13 @@ class BossBot(commands.Bot):
         if key in self.alias_map:
             return self.alias_map[key]
         for off in self.presets.keys():
-            if normalize_for_match(off).startswith(key) or key in normalize_for_match(off):
+            n = normalize_for_match(off)
+            if n.startswith(key) or key in n:
                 return off
         return None
 
     def _parse_kill_input(self, content: str) -> Optional[Tuple[str, datetime, Optional[int]]]:
+        # 例: 「スタン 1120」 / 「スタン 1120 4h」 / 「フェリス」
         parts = content.strip().split()
         if len(parts) == 0:
             return None
@@ -231,7 +251,7 @@ class BossBot(commands.Bot):
 
         return off_name, kill_dt, respawn_min
 
-    # ----------------- 通知送信の重複抑止 ----------------- #
+    # ----------------- 通知の重複抑止 ----------------- #
     def _sent_bucket(self, guild_id: int) -> Dict[str, int]:
         gkey = self._gkey(guild_id)
         if gkey not in self._sent_keys:
@@ -253,15 +273,18 @@ class BossBot(commands.Bot):
                 if ttl < nowts:
                     b.pop(k, None)
 
-    # ----------------- ループ（通知） ----------------- #
+    # ----------------- 通知ループ ----------------- #
     @tasks.loop(seconds=CHECK_SEC)
     async def tick(self):
-        await self.wait_until_ready()
+        """1分前 & 出現 の通知を1回だけ送る。処理はチャンネルごとに集約。"""
+        if not self.is_ready():
+            return
+
         self._cleanup_sent()
         n = now_utc()
 
-        for g in list(self.data.keys()):
-            guild = self.get_guild(int(g))
+        for gkey in list(self.data.keys()):
+            guild = self.get_guild(int(gkey))
             if not guild:
                 continue
 
@@ -271,7 +294,7 @@ class BossBot(commands.Bot):
             for st in self._all_bosses(guild.id):
                 if not st.next_spawn_utc or not st.channel_id:
                     continue
-                ch: discord.TextChannel = guild.get_channel(st.channel_id) or await guild.fetch_channel(st.channel_id)
+
                 center = datetime.fromtimestamp(st.next_spawn_utc, tz=timezone.utc)
 
                 # 1分前
@@ -298,36 +321,45 @@ class BossBot(commands.Bot):
                     st.skip += 1
                     self._set_boss(guild.id, st)
 
-            # 集約送信
+            # 集約送信（1チャンネル1メッセージ）
             for cid, arr in pre_labels.items():
-                ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
-                if arr:
-                    await ch.send("⏰ 1分前\n" + "\n".join(sorted(arr)))
-            for cid, arr in now_labels.items():
-                ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
-                if arr:
-                    await ch.send("🔥\n" + "\n".join(sorted(arr)))
+                try:
+                    ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
+                    if arr:
+                        await ch.send("⏰ 1分前\n" + "\n".join(sorted(arr)))
+                except Exception:
+                    pass
 
-    # ----------------- メッセージ監視（!省略でもOK） ----------------- #
+            for cid, arr in now_labels.items():
+                try:
+                    ch = guild.get_channel(cid) or await guild.fetch_channel(cid)
+                    if arr:
+                        await ch.send("🔥\n" + "\n".join(sorted(arr)))
+                except Exception:
+                    pass
+
+    # ----------------- メッセージ監視 ----------------- #
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
 
         content = message.content.strip()
-        # まず「管理系コマンド」（!省略OK）
+
+        # まずは「管理コマンド」（!省略可）
         if await self._maybe_handle_text_command(message, content):
             return
 
-        # 監視チャンネル以外では無視
+        # 監視対象チャンネル以外は無視
         if message.channel.id not in self._channels(message.guild.id):
             return
 
-        # 討伐入力（「ボス名 HHMM [x h]」形式）
+        # 討伐入力（「ボス名 HHMM [x h]」）
         parsed = self._parse_kill_input(content)
         if parsed:
             name, when_jst, respawn_override = parsed
             st = self._get_boss(message.guild.id, name) or BossState(
-                name=name, respawn_min=self.presets.get(name, (60, 100, 0))[0],
+                name=name,
+                respawn_min=self.presets.get(name, (60, 100, 0))[0],
                 rate=self.presets.get(name, (60, 100, 0))[1],
                 first_delay_min=self.presets.get(name, (60, 100, 0))[2],
             )
@@ -338,17 +370,19 @@ class BossBot(commands.Bot):
             st.next_spawn_utc = dt_to_ts(center)
             st.skip = 0
             self._set_boss(message.guild.id, st)
-            await message.add_reaction("✅")
+            try:
+                await message.add_reaction("✅")
+            except Exception:
+                pass
             return
 
         await self.process_commands(message)
 
-    # ----------------- テキストコマンド群（!省略対応） ----------------- #
+    # ----------------- テキストコマンド群（!省略OK） ----------------- #
     async def _maybe_handle_text_command(self, message: discord.Message, content: str) -> bool:
         raw = content
         if raw.startswith("!"):
             raw = raw[1:].strip()
-
         low = raw.lower()
 
         # hereon/hereoff
@@ -368,14 +402,13 @@ class BossBot(commands.Bot):
             await message.channel.send("このチャンネルを**監視対象OFF**にしました。")
             return True
 
-        # bt / btx
+        # bt / bt3 / bt6 / bt12 / bt24
         if low in ("bt", "bt3", "bt6", "bt12", "bt24"):
-            horizon = None
-            if low != "bt":
-                horizon = int(low[2:])
+            horizon = None if low == "bt" else int(low[2:])
             await self._send_bt(message.channel, message.guild.id, horizon)
             return True
 
+        # プリセット一覧
         if low in ("bosses", "list", "bname", "bnames"):
             lines = []
             for name, (rm, rate, fd) in sorted(self.presets.items(), key=lambda x: x[0]):
@@ -383,7 +416,8 @@ class BossBot(commands.Bot):
             await message.channel.send("\n".join(lines) or "プリセット無し")
             return True
 
-        if low.startswith("rh "):  # rh ボス名 8h
+        # 周期変更: rh ボス名 8h
+        if low.startswith("rh "):
             parts = raw.split()
             if len(parts) >= 3:
                 name = self._resolve_boss_name(parts[1]) or parts[1]
@@ -404,7 +438,8 @@ class BossBot(commands.Bot):
                 await message.channel.send("`rh ボス名 時間h` の形式で。")
             return True
 
-        if low.startswith("reset "):  # reset HHMM
+        # 全体リセット: reset HHMM
+        if low.startswith("reset "):
             p = raw.split()
             if len(p) == 2 and p[1].isdigit():
                 h, m = zfill_hhmm(p[1])
@@ -415,11 +450,13 @@ class BossBot(commands.Bot):
                 await message.channel.send("`reset HHMM` の形式で。")
             return True
 
+        # 再起動
         if low == "restart":
             await message.channel.send("再起動します。保存済みデータは引き継ぎます…")
             await asyncio.sleep(1)
             os._exit(0)
 
+        # ヘルプ
         if low in ("help", "commands"):
             await message.channel.send(self._help_text())
             return True
@@ -435,10 +472,11 @@ class BossBot(commands.Bot):
             "- 周期変更：`rh ボス名 8h`\n"
             "- 一覧(プリセット)：`bosses`\n"
             "- 全体リセット：`reset HHMM`\n"
-            "- 再起動：`restart`（Renderが自動再起動）\n"
+            "- 再起動：`restart`（Render が自動再起動）\n"
         )
 
     async def _reset_all(self, guild_id: int, base_jst: datetime):
+        """ユーザー要望どおりのリセット仕様"""
         for st in self._all_bosses(guild_id):
             preset = self.presets.get(st.name, (st.respawn_min, st.rate, st.first_delay_min))
             st.respawn_min, st.rate, st.first_delay_min = preset
@@ -460,6 +498,7 @@ class BossBot(commands.Bot):
             self._set_boss(guild_id, st)
 
     async def _send_bt(self, channel: discord.TextChannel, guild_id: int, horizon_h: Optional[int]):
+        """時刻順、時台切替で改行1つ"""
         items = []
         now = now_utc()
         for st in self._all_bosses(guild_id):
@@ -488,84 +527,47 @@ class BossBot(commands.Bot):
 
         await channel.send("\n".join(lines))
 
-# -------------------- Keepalive (aiohttp) -------------------- #
-_shutdown_event = asyncio.Event()
+    # -------------------- aiohttp /health -------------------- #
+    async def _start_health_app(self):
+        async def health(_req):
+            return web.json_response({"ok": True})
 
-async def _ok_json(_):
-    return web.json_response({"ok": True})
+        app = web.Application()
+        app.add_routes([web.get("/health", health), web.get("/", health)])
 
-async def _ok_head(_):
-    return web.Response(status=200)
-
-async def start_health_server(port: int):
-    app = web.Application()
-    app.router.add_get("/", _ok_json)
-    app.router.add_head("/", _ok_head)
-    app.router.add_get("/health", _ok_json)
-    app.router.add_head("/health", _ok_head)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    print(f"[HEALTH] Listening on :{port} (/, /health)")
-
-    try:
-        await _shutdown_event.wait()
-    finally:
-        await runner.cleanup()
-        print("[HEALTH] Shutdown")
-
-# -------------------- BOT 起動（429にリトライ・バックオフ） -------------------- #
-async def run_bot(bot: BossBot, token: str):
-    while True:
-        try:
-            await bot.start(token)
-        except discord.errors.HTTPException as e:
-            if getattr(e, "status", None) == 429:
-                wait = BACKOFF_429_MIN * 60 + random.randint(0, BACKOFF_JITTER_SEC)
-                print(f"[BOT] 429/RateLimited detected. Sleep {wait}s then retry.")
-                await asyncio.sleep(wait)
-                continue
-            else:
-                raise
-        except Exception as e:
-            print(f"[BOT] crashed: {e}. retry in 10s")
-            await asyncio.sleep(10)
-            continue
-        else:
-            break
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self._health_port)
+        await site.start()
+        self._health_runner = runner
+        print(f"INFO: health server started on 0.0.0.0:{self._health_port}")
 
 # -------------------- 起動 -------------------- #
-def run():
+async def _main():
     token = os.environ.get("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_TOKEN not set")
 
     bot = BossBot()
 
-    async def main_async():
-        port = int(os.environ.get("PORT", "10000"))
-
-        # 1) 先にヘルスサーバを起動（Renderのhealth check対策）
-        health_task = asyncio.create_task(start_health_server(port))
-        await asyncio.sleep(0.2)  # bind完了の小休止
-
-        # 2) BOT を起動
-        bot_task = asyncio.create_task(run_bot(bot, token))
-
-        done, pending = await asyncio.wait(
-            {health_task, bot_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        _shutdown_event.set()
-        for t in pending:
-            t.cancel()
-        for t in done:
-            exc = t.exception()
-            if exc:
-                raise exc
-
-    asyncio.run(main_async())
+    # 429 を食らったらバックオフして再試行
+    while True:
+        try:
+            await bot.start(token)
+        except discord.errors.HTTPException as e:
+            if getattr(e, "status", None) == 429:
+                wait = BACKOFF_429_MIN * 60 + random.randint(0, BACKOFF_JITTER_SEC)
+                print(f"WARN: 429 detected. backoff {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            raise
+        finally:
+            # 正常終了や例外時にもヘルスサーバを確実に閉じる
+            try:
+                await bot.close()
+            except Exception:
+                pass
+        break
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(_main())
