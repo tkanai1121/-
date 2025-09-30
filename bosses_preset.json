@@ -32,7 +32,7 @@
   {"name":"パンドライド","rate":100,"respawn_h":8,"initial_delay_h":0},
   {"name":"サヴァン","rate":100,"respawn_h":12,"initial_delay_h":6},
   {"name":"ドラゴンビースト","rate":50,"respawn_h":12,"initial_delay_h":14},
-  {"name":"バルポ","rate":50,"respawn_h":8,"initial_delay_h":6},
+  {"name":"バルボ","rate":50,"respawn_h":8,"initial_delay_h":6},
   {"name":"セル","rate":33,"respawn_h":7.5,"initial_delay_h":0},
   {"name":"コルーン","rate":100,"respawn_h":10,"initial_delay_h":6},
   {"name":"オルフェン","rate":33,"respawn_h":24,"initial_delay_h":14},
